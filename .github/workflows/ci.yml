@@ -10,64 +10,16 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Detect which files changed so downstream jobs can run conditionally.
-  # ---------------------------------------------------------------------------
-  changes:
-    name: Detect changes
-    runs-on: ubuntu-latest
-    outputs:
-      dockerfile: ${{ steps.filter.outputs.dockerfile }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dorny/paths-filter@v3
-        id: filter
-        with:
-          filters: |
-            dockerfile:
-              - 'Dockerfile'
-
-  # ---------------------------------------------------------------------------
-  # Only runs when the Dockerfile changes. Builds and pushes the build-env
-  # image to Docker Hub.
-  # ---------------------------------------------------------------------------
-  docker:
-    name: Build and push image
-    needs: changes
-    if: needs.changes.outputs.dockerfile == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: docker/setup-buildx-action@v3
-
-      - uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: vinaydivakar/heart-rate-build-env:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  # ---------------------------------------------------------------------------
   # Build the firmware (MCUboot + app via sysbuild) and run unit tests.
-  # Runs if docker succeeded (Dockerfile changed) or was skipped (unchanged).
   # Warnings in app code are treated as errors; scoped to the app domain only
   # so MCUboot upstream warnings do not break the build.
   # West workspace is cached by west.yml hash to avoid re-downloading NCS.
   # ---------------------------------------------------------------------------
   build-and-test:
     name: Build & Test
-    needs: [changes, docker]
-    if: always() && needs.changes.result == 'success' && (needs.docker.result == 'success' || needs.docker.result == 'skipped')
     runs-on: ubuntu-latest
     container:
-      image: vinaydivakar/heart-rate-build-env:latest
+      image: vinaydivakar/zephyr-devenv:ncs-v3.2.0
 
     steps:
       - name: Checkout
