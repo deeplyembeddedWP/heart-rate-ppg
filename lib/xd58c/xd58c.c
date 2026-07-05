@@ -159,6 +159,20 @@ static void _compute_bpm(void) {
   /* Step 3: forward real FFT — transforms fft_input (time domain) into
    * fft_output (frequency domain).*/
   arm_rfft_fast_f32(&_this.fft_rfft, _this.fft_input, _this.fft_output, 0);
+
+#if defined(CONFIG_XD58C_FFT_DEBUG)
+  /* Compute magnitude (sqrtf(re^2 + im^2)) for bins 1-10 and emit as CSV.
+   to visualise the spectrum. */
+  int pos = snprintk(_this.fft_dbg_buf, sizeof(_this.fft_dbg_buf), "FFT:");
+  for (uint32_t k = BPM_BIN_MIN; k <= BPM_BIN_MAX; k++) {
+    float32_t re = _this.fft_output[2U * k];
+    float32_t im = _this.fft_output[2U * k + 1U];
+    uint32_t mag = (uint32_t)sqrtf(re * re + im * im);
+    pos += snprintk(_this.fft_dbg_buf + pos, sizeof(_this.fft_dbg_buf) - pos,
+                    k < BPM_BIN_MAX ? "%u," : "%u\r\n", mag);
+  }
+  _uart_send(_this.fft_dbg_buf, (size_t)pos);
+#endif /* CONFIG_XD58C_FFT_DEBUG */
 }
 #endif /* CONFIG_XD58C_FFT_BPM */
 
@@ -175,7 +189,19 @@ int xd58c_process(void) {
     return err;
   }
 
+#if defined(CONFIG_XD58C_FFT_BPM)
+  _this.fft_ibuf[_this.fft_write_idx] = sample;
+  _this.fft_write_idx = (_this.fft_write_idx + 1U) & (FFT_SIZE - 1U);
+  _this.fft_sample_count++;
+
+  /* Fire after warmup (FFT_SIZE samples), then every FFT_HOP samples */
+  if (_this.fft_sample_count >= FFT_SIZE &&
+      ((_this.fft_sample_count - FFT_SIZE) % FFT_HOP) == 0U) {
+    _compute_bpm();
+  }
+#else
   _uart_write(sample);
+#endif /* CONFIG_XD58C_FFT_BPM */
 
   return 0;
 }
