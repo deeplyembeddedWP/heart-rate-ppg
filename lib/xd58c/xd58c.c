@@ -14,11 +14,11 @@
 #if defined(CONFIG_XD58C_FFT_BPM)
 #include <arm_math.h>
 
-#define FFT_SIZE        512U
-#define FFT_HOP         256U
+#define FFT_SIZE 512U
+#define FFT_HOP 256U
 #define FFT_SAMPLE_RATE 200U
-#define BPM_BIN_MIN       1U
-#define BPM_BIN_MAX      10U
+#define BPM_BIN_MIN 1U
+#define BPM_BIN_MAX 10U
 #endif /* CONFIG_XD58C_FFT_BPM */
 
 LOG_MODULE_REGISTER(xd58c, CONFIG_XD58C_LOG_LEVEL);
@@ -137,21 +137,28 @@ static void _uart_write_bpm(uint32_t bpm) {
   }
   _uart_send(_this.tx_buf, (size_t)len);
 }
-#if defined(CONFIG_XD58C_FFT_BPM)
+
 static void _compute_bpm(void) {
   /* Step 1: compute mean of ring buffer for DC removal */
   float32_t mean = 0.0f;
+
   for (uint32_t i = 0U; i < FFT_SIZE; i++) {
     mean += (float32_t)_this.fft_ibuf[i];
   }
   mean /= (float32_t)FFT_SIZE;
 
-  /* Step 2: unroll circular buffer into fft_input, subtract mean and apply Hann window */
+  /* Step 2: unroll circular buffer into fft_input, subtract mean and apply Hann
+   * window */
   uint32_t rd = _this.fft_write_idx;
   for (uint32_t i = 0U; i < FFT_SIZE; i++) {
-    _this.fft_input[i] = ((float32_t)_this.fft_ibuf[rd] - mean) * _this.fft_hann[i];
+    _this.fft_input[i] =
+        ((float32_t)_this.fft_ibuf[rd] - mean) * _this.fft_hann[i];
     rd = (rd + 1U) & (FFT_SIZE - 1U);
   }
+
+  /* Step 3: forward real FFT — transforms fft_input (time domain) into
+   * fft_output (frequency domain).*/
+  arm_rfft_fast_f32(&_this.fft_rfft, _this.fft_input, _this.fft_output, 0);
 }
 #endif /* CONFIG_XD58C_FFT_BPM */
 
