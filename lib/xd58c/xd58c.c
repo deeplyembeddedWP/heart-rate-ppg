@@ -11,6 +11,16 @@
 #include <autoconf.h>
 #include <lib/xd58c.h>
 
+#if defined(CONFIG_XD58C_FFT_BPM)
+#include <arm_math.h>
+
+#define FFT_SIZE        512U
+#define FFT_HOP         256U
+#define FFT_SAMPLE_RATE 200U
+#define BPM_BIN_MIN       1U
+#define BPM_BIN_MAX      10U
+#endif /* CONFIG_XD58C_FFT_BPM */
+
 LOG_MODULE_REGISTER(xd58c, CONFIG_XD58C_LOG_LEVEL);
 
 #define MESSAGE_QUEUE_SIZE 64
@@ -25,8 +35,20 @@ static struct {
   int32_t dc;
   struct k_msgq queue;
   char buffer[MESSAGE_QUEUE_SIZE * sizeof(int16_t)];
-  char tx_buf[8];
+  char tx_buf[12];
   struct k_sem tx_sem;
+#if defined(CONFIG_XD58C_FFT_BPM)
+  arm_rfft_fast_instance_f32 fft_rfft;
+  float32_t fft_hann[FFT_SIZE];
+  float32_t fft_input[FFT_SIZE];
+  float32_t fft_output[FFT_SIZE];
+  int16_t fft_ibuf[FFT_SIZE];
+  uint32_t fft_write_idx;
+  uint32_t fft_sample_count;
+#if defined(CONFIG_XD58C_FFT_DEBUG)
+  char fft_dbg_buf[128];
+#endif /* CONFIG_XD58C_FFT_DEBUG */
+#endif /* CONFIG_XD58C_FFT_BPM */
 } _this = {
     .adc_chan = ADC_DT_SPEC_GET(DT_PATH(zephyr_user)),
     .uart = DEVICE_DT_GET(DT_NODELABEL(uart0)),
@@ -85,25 +107,37 @@ static void _tx_callback(const struct device *dev, struct uart_event *evt,
  *
  * @param raw The 16-bit sample to transmit as a formatted string.
  */
+static void _uart_send(const char *buf, size_t len) {
+  int err = uart_tx(_this.uart, (const uint8_t *)buf, len, SYS_FOREVER_US);
+  if (err) {
+    LOG_ERR("uart_tx (err %d)", err);
+    return;
+  }
+  err = k_sem_take(&_this.tx_sem, K_FOREVER);
+  if (err) {
+    LOG_ERR("uart tx wait (err %d)", err);
+  }
+}
+
 static void _uart_write(int16_t raw) {
   int len = snprintk(_this.tx_buf, sizeof(_this.tx_buf), "%d\r\n", raw);
   if (len < 0 || !len || (size_t)len >= sizeof(_this.tx_buf)) {
     LOG_ERR("snprintk (err %d)", len);
     return;
   }
+  _uart_send(_this.tx_buf, (size_t)len);
+}
 
-  int err = uart_tx(_this.uart, (const uint8_t *)_this.tx_buf, (size_t)len,
-                    SYS_FOREVER_US);
-  if (err) {
-    LOG_ERR("uart_tx (err %d)", err);
+#if defined(CONFIG_XD58C_FFT_BPM)
+static void _uart_write_bpm(uint32_t bpm) {
+  int len = snprintk(_this.tx_buf, sizeof(_this.tx_buf), "BPM:%u\r\n", bpm);
+  if (len < 0 || (size_t)len >= sizeof(_this.tx_buf)) {
+    LOG_ERR("snprintk BPM (err %d)", len);
     return;
   }
-
-  err = k_sem_take(&_this.tx_sem, K_FOREVER);
-  if (err) {
-    LOG_ERR("uart tx wait (err %d)", err);
-  }
+  _uart_send(_this.tx_buf, (size_t)len);
 }
+#endif /* CONFIG_XD58C_FFT_BPM */
 
 /**
  * @brief Fetches a sample from the message queue and transmits it.
@@ -170,6 +204,17 @@ int xd58c_init(void) {
   }
 
   k_sem_init(&_this.tx_sem, 0, 1);
+
+#if defined(CONFIG_XD58C_FFT_BPM)
+  arm_status arm_err = arm_rfft_fast_init_f32(&_this.fft_rfft, FFT_SIZE);
+  if (arm_err != ARM_MATH_SUCCESS) {
+    LOG_ERR("RFFT init (arm_err %d)", arm_err);
+    return -ENOTSUP;
+  }
+  arm_hanning_f32(_this.fft_hann, FFT_SIZE);
+  _this.fft_write_idx = 0U;
+  _this.fft_sample_count = 0U;
+#endif /* CONFIG_XD58C_FFT_BPM */
 
   err = uart_callback_set(_this.uart, _tx_callback, NULL);
   if (err) {
