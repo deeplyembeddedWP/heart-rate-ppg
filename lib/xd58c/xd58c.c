@@ -19,11 +19,19 @@
 #define FFT_SAMPLE_RATE 200U
 #define BPM_BIN_MIN 1U
 #define BPM_BIN_MAX 10U
+/* Debug CSV covers bins up to 3*BPM_BIN_MAX so every k in the search range
+ * has its 2nd and 3rd harmonic bins available for offline HPS analysis. */
+#define FFT_DEBUG_BIN_MAX (BPM_BIN_MAX * 3U)
 #endif /* CONFIG_XD58C_FFT_BPM */
 
 LOG_MODULE_REGISTER(xd58c, CONFIG_XD58C_LOG_LEVEL);
 
 #define MESSAGE_QUEUE_SIZE 64
+/* ADC counts; larger than typical steady-state baseline wander (observed
+ * ~100-450 counts, see README raw_adc characterization), small enough to
+ * reliably catch a genuine finger placement/removal transient. Empirical
+ * starting point — may need tuning against real contact-transient data. */
+#define DC_RESET_THRESHOLD 1500
 
 static struct {
   const struct adc_dt_spec adc_chan;
@@ -45,14 +53,15 @@ static struct {
   int16_t fft_ibuf[FFT_SIZE];
   uint32_t fft_write_idx;
   uint32_t fft_sample_count;
+
 #if defined(CONFIG_XD58C_FFT_DEBUG)
-  char fft_dbg_buf[128];
-#endif /* CONFIG_XD58C_FFT_DEBUG */
-#endif /* CONFIG_XD58C_FFT_BPM */
+  char fft_dbg_buf[256]; /* holds "FFT:" + 30 comma-separated 5-digit mags */
+#endif                   /* CONFIG_XD58C_FFT_DEBUG */
+#endif                   /* CONFIG_XD58C_FFT_BPM */
 } _this = {
     .adc_chan = ADC_DT_SPEC_GET(DT_PATH(zephyr_user)),
     .uart = DEVICE_DT_GET(DT_NODELABEL(uart0)),
-    .shift = 5,
+    .shift = 7,
 };
 
 /**
@@ -72,6 +81,19 @@ static enum adc_action _callback(const struct device *dev,
                                  uint16_t sampling_index) {
 
   int16_t raw = *(int16_t *)sequence->buffer;
+
+  /* Detect a large step in the DC level (finger just placed or removed) and
+   * snap the tracker straight to it, instead of waiting several time
+   * constants (~2s at shift=7) for the leaky integrator to slowly converge. */
+  int32_t dc_est = _this.dc >> _this.shift;
+  int32_t step = (int32_t)raw - dc_est;
+  if (step < 0) {
+    step = -step;
+  }
+  if (step > DC_RESET_THRESHOLD) {
+    _this.dc = ((int32_t)raw) << _this.shift;
+  }
+
   _this.dc = _this.dc - (_this.dc >> _this.shift) + raw;
   int16_t ac = raw - (int16_t)(_this.dc >> _this.shift);
 
@@ -161,18 +183,79 @@ static void _compute_bpm(void) {
   arm_rfft_fast_f32(&_this.fft_rfft, _this.fft_input, _this.fft_output, 0);
 
 #if defined(CONFIG_XD58C_FFT_DEBUG)
-  /* Compute magnitude (sqrtf(re^2 + im^2)) for bins 1-10 and emit as CSV.
-   to visualise the spectrum. */
+  /* Emit CSV of sqrtf magnitudes for bins 1-FFT_DEBUG_BIN_MAX so offline
+   * analysis can reconstruct full 3-harmonic HPS for every k up to
+   * BPM_BIN_MAX, not just k where 2k,3k <= BPM_BIN_MAX. */
   int pos = snprintk(_this.fft_dbg_buf, sizeof(_this.fft_dbg_buf), "FFT:");
-  for (uint32_t k = BPM_BIN_MIN; k <= BPM_BIN_MAX; k++) {
+  for (uint32_t k = BPM_BIN_MIN; k <= FFT_DEBUG_BIN_MAX; k++) {
     float32_t re = _this.fft_output[2U * k];
     float32_t im = _this.fft_output[2U * k + 1U];
     uint32_t mag = (uint32_t)sqrtf(re * re + im * im);
     pos += snprintk(_this.fft_dbg_buf + pos, sizeof(_this.fft_dbg_buf) - pos,
-                    k < BPM_BIN_MAX ? "%u," : "%u\r\n", mag);
+                    k < FFT_DEBUG_BIN_MAX ? "%u," : "%u\r\n", mag);
   }
   _uart_send(_this.fft_dbg_buf, (size_t)pos);
 #endif /* CONFIG_XD58C_FFT_DEBUG */
+
+  /* Step 4: Harmonic Product Spectrum peak search.
+   * H[k] = |X[k]|^2 * |X[2k]|^2 * |X[3k]|^2
+   * Suppresses harmonics: the fundamental is the only bin where all three
+   * harmonic slots are simultaneously large. Uses squared magnitude to
+   * avoid sqrtf. Harmonics up to 3k=30 are well within the 256-bin output.
+   * hps_vals[] keeps every H[k] (not just the peak) so Step 5 can look up
+   * the peak's neighbors for parabolic interpolation. */
+  float32_t hps_vals[BPM_BIN_MAX - BPM_BIN_MIN + 1U];
+  float32_t hps_peak = 0.0f;
+  uint32_t peak_bin = BPM_BIN_MIN;
+
+  for (uint32_t k = BPM_BIN_MIN; k <= BPM_BIN_MAX; k++) {
+    float32_t re, im;
+
+    re = _this.fft_output[2U * k];
+    im = _this.fft_output[2U * k + 1U];
+    float32_t hps = re * re + im * im;
+
+    re = _this.fft_output[4U * k];
+    im = _this.fft_output[4U * k + 1U];
+    hps *= re * re + im * im;
+
+    re = _this.fft_output[6U * k];
+    im = _this.fft_output[6U * k + 1U];
+    hps *= re * re + im * im;
+
+    hps_vals[k - BPM_BIN_MIN] = hps;
+
+    if (hps > hps_peak) {
+      hps_peak = hps;
+      peak_bin = k;
+    }
+  }
+
+  /* Step 5: parabolic interpolation around peak_bin for sub-bin accuracy.
+   * Fits a parabola through (peak_bin-1, peak_bin, peak_bin+1) in the HPS
+   * array and solves for its vertex — the FFT resolution (23.4 BPM/bin) only
+   * gives an integer bin, but the true fundamental usually sits between
+   * bins. Skipped at the search-range edges, where one neighbor doesn't
+   * exist. offset is mathematically bounded to (-0.5, 0.5) whenever it's
+   * computed (peak_bin has the largest H[k] of the three by construction),
+   * so no extra clamping is needed. */
+  float32_t k_true = (float32_t)peak_bin;
+  if (peak_bin > BPM_BIN_MIN && peak_bin < BPM_BIN_MAX) {
+    float32_t h_prev = hps_vals[peak_bin - 1U - BPM_BIN_MIN];
+    float32_t h_curr = hps_vals[peak_bin - BPM_BIN_MIN];
+    float32_t h_next = hps_vals[peak_bin + 1U - BPM_BIN_MIN];
+    float32_t denom = h_prev - 2.0f * h_curr + h_next;
+    if (denom != 0.0f) {
+      float32_t offset = 0.5f * (h_prev - h_next) / denom;
+      k_true = (float32_t)peak_bin + offset;
+    }
+  }
+
+  /* Step 6: convert interpolated bin to BPM and transmit. */
+  uint32_t bpm = (uint32_t)(k_true * (float32_t)(FFT_SAMPLE_RATE * 60U) /
+                                 (float32_t)FFT_SIZE +
+                             0.5f);
+  _uart_write_bpm(bpm);
 }
 #endif /* CONFIG_XD58C_FFT_BPM */
 
