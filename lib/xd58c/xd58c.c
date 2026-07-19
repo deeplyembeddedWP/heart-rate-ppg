@@ -27,11 +27,33 @@
 LOG_MODULE_REGISTER(xd58c, CONFIG_XD58C_LOG_LEVEL);
 
 #define MESSAGE_QUEUE_SIZE 64
-/* ADC counts; larger than typical steady-state baseline wander (observed
- * ~100-450 counts, see README raw_adc characterization), small enough to
- * reliably catch a genuine finger placement/removal transient. Empirical
- * starting point — may need tuning against real contact-transient data. */
-#define DC_RESET_THRESHOLD 1500
+
+/* 4th-order Butterworth filters, each realized as 2 cascaded biquad (SOS)
+ * sections at fs = 200Hz. Cascading 2 sections doubles the rolloff slope
+ * of a single biquad (12dB/octave -> 24dB/octave) versus the prior 2nd-order
+ * design, without touching the -3dB corner. */
+typedef struct {
+  float b0, b1, b2;
+  float a1, a2;
+} biquad_coeffs_t;
+
+typedef struct {
+  float x1, x2, y1, y2;
+} biquad_state_t;
+
+#define HPF_STAGES 2U
+static const biquad_coeffs_t HPF_COEFFS[HPF_STAGES] = {
+    {0.9796854872f, -1.959370974f, 0.9796854872f, -1.971148609f,
+     0.9713918146f},
+    {1.0f, -2.0f, 1.0f, -1.98780471f, 0.9880499706f},
+};
+
+#define LPF_STAGES 2U
+static const biquad_coeffs_t LPF_COEFFS[LPF_STAGES] = {
+    {1.32937289e-05f, 2.65874578e-05f, 1.32937289e-05f, -1.778313488f,
+     0.7924474718f},
+    {1.0f, 2.0f, 1.0f, -1.893415601f, 0.9084644129f},
+};
 
 static struct {
   const struct adc_dt_spec adc_chan;
@@ -64,43 +86,64 @@ static struct {
     .shift = 7,
 };
 
-/**
- * @brief ADC sampling callback.
- *
- * This function is called by the ADC driver after each sample is collected.
- * It performs DC offset removal (high-pass filtering) and enqueues the
- * resulting AC signal into the message queue for the application layer.
- *
- * @param dev Pointer to the ADC device.
- * @param sequence Pointer to the ADC sequence.
- * @param sampling_index Index of the current sample.
- * @return ADC_ACTION_REPEAT to continue sampling automatically.
- */
+static float _biquad_apply(const biquad_coeffs_t *c, biquad_state_t *s,
+                           float input) {
+  float output =
+      c->b0 * input + c->b1 * s->x1 + c->b2 * s->x2 - c->a1 * s->y1 -
+      c->a2 * s->y2;
+
+  s->x2 = s->x1;
+  s->x1 = input;
+
+  s->y2 = s->y1;
+  s->y1 = output;
+
+  return output;
+}
+
+static float _hpf_0_5Hz(float input) {
+  static biquad_state_t state[HPF_STAGES];
+
+  float output = input;
+  for (uint32_t i = 0U; i < HPF_STAGES; i++) {
+    output = _biquad_apply(&HPF_COEFFS[i], &state[i], output);
+  }
+
+  return output;
+}
+
+static float _lpf_4Hz(float input) {
+  static biquad_state_t state[LPF_STAGES];
+
+  float output = input;
+  for (uint32_t i = 0U; i < LPF_STAGES; i++) {
+    output = _biquad_apply(&LPF_COEFFS[i], &state[i], output);
+  }
+
+  return output;
+}
+
 static enum adc_action _callback(const struct device *dev,
                                  const struct adc_sequence *sequence,
                                  uint16_t sampling_index) {
 
-  int16_t raw = *(int16_t *)sequence->buffer;
+  int16_t adc_raw = *(int16_t *)sequence->buffer;
 
-  /* Detect a large step in the DC level (finger just placed or removed) and
-   * snap the tracker straight to it, instead of waiting several time
-   * constants (~2s at shift=7) for the leaky integrator to slowly converge. */
-  int32_t dc_est = _this.dc >> _this.shift;
-  int32_t step = (int32_t)raw - dc_est;
-  if (step < 0) {
-    step = -step;
-  }
-  if (step > DC_RESET_THRESHOLD) {
-    _this.dc = ((int32_t)raw) << _this.shift;
-  }
+  float hpf_out = _hpf_0_5Hz(
+      (float)adc_raw); // 4th order hpf, fc = 0.5Hz (removes dc baseline)
+  float lpf_out = _lpf_4Hz(
+      hpf_out); // 4th order lpf, fc = 4Hz (removes high frequency noise)
+  int16_t output = (int16_t)lpf_out;
 
-  _this.dc = _this.dc - (_this.dc >> _this.shift) + raw;
-  int16_t ac = raw - (int16_t)(_this.dc >> _this.shift);
+  LOG_INF("raw=%d hpf_out=%d lpf_out=%d out=%d", adc_raw, (int)hpf_out,
+          (int)lpf_out, output);
 
-  int err = k_msgq_put(&_this.queue, &ac, K_NO_WAIT);
-  if (err) {
-    LOG_ERR("enqueue (err %d)", err);
-  }
+  // int16_t output = (int16_t)ppg_output;
+
+  // int err = k_msgq_put(&_this.queue, &output, K_NO_WAIT);
+  // if (err) {
+  //   LOG_ERR("enqueue failed (%d)", err);
+  // }
 
   return ADC_ACTION_REPEAT;
 }
@@ -157,6 +200,7 @@ static void _uart_write_bpm(uint32_t bpm) {
     LOG_ERR("snprintk BPM (err %d)", len);
     return;
   }
+  // LOG_INF("BPM:%u", bpm);
   _uart_send(_this.tx_buf, (size_t)len);
 }
 
@@ -253,8 +297,8 @@ static void _compute_bpm(void) {
 
   /* Step 6: convert interpolated bin to BPM and transmit. */
   uint32_t bpm = (uint32_t)(k_true * (float32_t)(FFT_SAMPLE_RATE * 60U) /
-                                 (float32_t)FFT_SIZE +
-                             0.5f);
+                                (float32_t)FFT_SIZE +
+                            0.5f);
   _uart_write_bpm(bpm);
 }
 #endif /* CONFIG_XD58C_FFT_BPM */
