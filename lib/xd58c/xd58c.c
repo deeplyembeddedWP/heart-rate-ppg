@@ -43,8 +43,7 @@ typedef struct {
 
 #define HPF_STAGES 2U
 static const biquad_coeffs_t HPF_COEFFS[HPF_STAGES] = {
-    {0.9796854872f, -1.959370974f, 0.9796854872f, -1.971148609f,
-     0.9713918146f},
+    {0.9796854872f, -1.959370974f, 0.9796854872f, -1.971148609f, 0.9713918146f},
     {1.0f, -2.0f, 1.0f, -1.98780471f, 0.9880499706f},
 };
 
@@ -88,9 +87,8 @@ static struct {
 
 static float _biquad_apply(const biquad_coeffs_t *c, biquad_state_t *s,
                            float input) {
-  float output =
-      c->b0 * input + c->b1 * s->x1 + c->b2 * s->x2 - c->a1 * s->y1 -
-      c->a2 * s->y2;
+  float output = c->b0 * input + c->b1 * s->x1 + c->b2 * s->x2 - c->a1 * s->y1 -
+                 c->a2 * s->y2;
 
   s->x2 = s->x1;
   s->x1 = input;
