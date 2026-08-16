@@ -32,9 +32,47 @@ dts/bindings/   Custom devicetree bindings
 ## How it works
 
 1. `xd58c_init()` — configures the ADC channel at 200 Hz (5 ms interval), registers an async UART callback, and starts continuous ADC sampling.
-2. ADC callback — on each sample, subtracts a running DC estimate (single-pole IIR high-pass, shift = 5) to extract the AC pulse waveform, then enqueues the result.
+2. ADC callback — each raw sample passes through a cascaded 4th-order Butterworth highpass (0.5 Hz) then a cascaded 4th-order Butterworth lowpass (4 Hz) to isolate the cardiac AC waveform, then the result is enqueued. See [Filter frequency response](#filter-frequency-response) below for details.
 3. `xd58c_process()` — dequeues one sample and transmits it as a decimal string (`"<value>\r\n"`) over UART0.
 4. `main()` calls `xd58c_init()` once, then loops on `xd58c_process()`.
+
+## Filter frequency response
+
+`lib/xd58c/xd58c.c` filters every ADC sample through two cascaded biquad filters before it reaches the application:
+
+- **`_hpf_0_5Hz`** — 0.5 Hz highpass, removes DC baseline / slow drift.
+- **`_lpf_4Hz`** — 4 Hz lowpass, removes high-frequency noise above the cardiac band.
+
+Together they pass roughly **30–240 BPM** (0.5–4 Hz) with margin around the target 40–230 BPM measurement range.
+
+Both filters are implemented as **2 cascaded biquad sections** (4th-order Butterworth), which was chosen over a single biquad (2nd-order) or a single-pole design (1st-order) specifically for its steeper rolloff — each added order doubles the attenuation slope past the cutoff, at the cost of some added filter state/compute (negligible on the nRF52840) and a slightly slower step response.
+
+| Order | Rolloff | HPF/LPF sections | Notes |
+|-------|---------|-------------------|-------|
+| 1st | 6 dB/octave | single-pole | Fastest to settle, weakest noise rejection — the old DC-tracking approach was roughly equivalent to this |
+| 2nd | 12 dB/octave | 1 biquad | Previous implementation |
+| **4th (current)** | **24 dB/octave** | **2 cascaded biquads** | Current implementation |
+
+### Why 4th order
+
+The sensor's raw ADC signal carries a persistent, sharp interference tone around **20 Hz** (plus harmonics at 40/60/80 Hz) — likely PWM, mechanical vibration, or a switching artifact — that sits well outside the 0.5–4 Hz cardiac band but close enough that a shallow rolloff barely touches it. Applying each candidate filter order's theoretical lowpass response to a real captured raw spectrum (`samples.log`) shows the difference concretely:
+
+![Filter order comparison](docs/filter_order_comparison.png)
+
+![Noise suppression by filter order](docs/filter_order_noise_suppression.png)
+
+Measured attenuation at the interference tone and its harmonics, applying each order's 4 Hz lowpass to the same captured raw spectrum:
+
+| Tone | Raw (dB) | After 1st order | After 2nd order | After 4th order (current) |
+|------|---------:|-----------------:|-----------------:|---------------------------:|
+| 20 Hz (interference) | 26.14 | 11.75 | -2.31 | **-30.76** |
+| 40 Hz (2nd harmonic) | 19.85 | -1.39 | -22.56 | **-64.97** |
+| 60 Hz (3rd harmonic) | 16.84 | -10.01 | -36.85 | **-90.54** |
+| 80 Hz (4th harmonic) | 15.85 | -17.98 | -51.80 | **-119.45** |
+
+At 1st order the 20 Hz interference is barely touched (still +11.75 dB — louder than the noise floor). At 2nd order it drops close to 0 dB but is still a visible spike above the surrounding floor. At 4th order (current) it's pushed to -30.76 dB — roughly at or below the local noise floor and no longer a distinguishable spectral feature, with the harmonics suppressed even further. This was verified against real hardware captures, not just the analytic model — see the interactive Bode plot / measured PSD below for the live comparison.
+
+**Interactive Bode plot + measured spectrum:** [xd58c Filter Frequency Response](https://claude.ai/code/artifact/59b802e4-a292-4a3a-9cb1-cb7f7538e935) — hover for exact dB values at any frequency, toggle table view, and compare the analytic 4th-order response against a Welch PSD of an actual `samples.log` capture.
 
 ## Prerequisites
 
