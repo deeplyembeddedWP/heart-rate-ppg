@@ -55,7 +55,7 @@ Both filters are implemented as **2 cascaded biquad sections** (4th-order Butter
 
 ### Why 4th order
 
-The sensor's raw ADC signal carries a persistent, sharp interference tone around **20 Hz** (plus harmonics at 40/60/80 Hz) — likely PWM, mechanical vibration, or a switching artifact — that sits well outside the 0.5–4 Hz cardiac band but close enough that a shallow rolloff barely touches it. Applying each candidate filter order's theoretical lowpass response to a real captured raw spectrum (`samples.log`) shows the difference concretely:
+The sensor's raw ADC signal carries a persistent interference tone around **20 Hz** (plus harmonics at 40/60/80 Hz) — likely PWM, mechanical vibration, or a switching artifact — that sits well outside the 0.5–4 Hz cardiac band but close enough that a shallow rolloff barely touches it. Applying each candidate filter order's theoretical lowpass response to a real captured raw spectrum (`samples.log`, finger-on capture) shows the difference concretely:
 
 ![Filter order comparison](docs/filter_order_comparison.png)
 
@@ -65,12 +65,12 @@ Measured attenuation at the interference tone and its harmonics, applying each o
 
 | Tone | Raw (dB) | After 1st order | After 2nd order | After 4th order (current) |
 |------|---------:|-----------------:|-----------------:|---------------------------:|
-| 20 Hz (interference) | 26.14 | 11.75 | -2.31 | **-30.76** |
-| 40 Hz (2nd harmonic) | 19.85 | -1.39 | -22.56 | **-64.97** |
-| 60 Hz (3rd harmonic) | 16.84 | -10.01 | -36.85 | **-90.54** |
-| 80 Hz (4th harmonic) | 15.85 | -17.98 | -51.80 | **-119.45** |
+| 20 Hz (interference) | 9.49 | -4.89 | -18.96 | **-47.40** |
+| 40 Hz (2nd harmonic) | 0.79 | -20.45 | -41.62 | **-84.03** |
+| 60 Hz (3rd harmonic) | -1.07 | -27.93 | -54.76 | **-108.45** |
+| 80 Hz (4th harmonic) | -1.79 | -35.62 | -69.44 | **-137.09** |
 
-At 1st order the 20 Hz interference is barely touched (still +11.75 dB — louder than the noise floor). At 2nd order it drops close to 0 dB but is still a visible spike above the surrounding floor. At 4th order (current) it's pushed to -30.76 dB — roughly at or below the local noise floor and no longer a distinguishable spectral feature, with the harmonics suppressed even further. This was verified against real hardware captures, not just the analytic model — see the interactive Bode plot / measured PSD below for the live comparison.
+At 1st order the 20 Hz interference is only pulled down a few dB, still close to the surrounding floor. At 2nd order it's clearly attenuated but remains a visible bump. At 4th order (current) it's pushed to -47.4 dB — over 55 dB below its raw level and well beneath the noise floor, with the harmonics suppressed even further. This was verified against real hardware captures, not just the analytic model — see the interactive Bode plot / measured PSD below for the live comparison.
 
 **Interactive Bode plot + measured spectrum:** [xd58c Filter Frequency Response](https://claude.ai/code/artifact/59b802e4-a292-4a3a-9cb1-cb7f7538e935) — hover for exact dB values at any frequency, toggle table view, and compare the analytic 4th-order response against a Welch PSD of an actual `samples.log` capture.
 
