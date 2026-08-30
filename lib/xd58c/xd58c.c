@@ -12,6 +12,7 @@
 #include <lib/xd58c.h>
 
 #include <arm_math.h>
+#include <math.h>
 
 LOG_MODULE_REGISTER(xd58c, CONFIG_XD58C_LOG_LEVEL);
 
@@ -179,6 +180,8 @@ static void _uart_write_bpm(uint32_t bpm) {
   _uart_send(_this.tx_buf, (size_t)len);
 }
 
+#define HPS_BIN_COUNT (BPM_BIN_MAX - BPM_BIN_MIN + 1U)
+
 /**
  * @brief Harmonic Product Spectrum peak search over _this.fft_output.
  *
@@ -188,10 +191,13 @@ static void _uart_write_bpm(uint32_t bpm) {
  * magnitude to avoid sqrtf. Harmonics up to 3k=30 are well within the
  * 256-bin output.
  *
- * @param out_hps_peak Set to the HPS value at the winning bin.
+ * @param out_hps_vals Filled with every H[k] (BPM_BIN_MIN..BPM_BIN_MAX), so
+ *                      the caller can interpolate around the peak.
+ * @param out_hps_peak  Set to the HPS value at the winning bin.
  * @return The bin index (BPM_BIN_MIN..BPM_BIN_MAX) with the largest H[k].
  */
-static uint32_t _hps_peak_bin(float32_t *out_hps_peak) {
+static uint32_t _hps_peak_bin(float32_t out_hps_vals[HPS_BIN_COUNT],
+                              float32_t *out_hps_peak) {
   float32_t hps_peak = 0.0f;
   uint32_t peak_bin = BPM_BIN_MIN;
 
@@ -210,6 +216,8 @@ static uint32_t _hps_peak_bin(float32_t *out_hps_peak) {
     im = _this.fft_output[6U * k + 1U];
     hps *= re * re + im * im;
 
+    out_hps_vals[k - BPM_BIN_MIN] = hps;
+
     if (hps > hps_peak) {
       hps_peak = hps;
       peak_bin = k;
@@ -218,6 +226,41 @@ static uint32_t _hps_peak_bin(float32_t *out_hps_peak) {
 
   *out_hps_peak = hps_peak;
   return peak_bin;
+}
+
+/**
+ * @brief Parabolic (quadratic) interpolation around the HPS peak for
+ * sub-bin frequency accuracy.
+ *
+ * Fits a parabola through (peak_bin-1, peak_bin, peak_bin+1) in the HPS
+ * array and solves for its vertex. FFT resolution alone (23.4 BPM/bin) only
+ * gives an integer bin, but the true fundamental usually sits between bins;
+ * fitting the curvature of the surrounding 3 points estimates where. Skipped
+ * at the search-range edges, where one neighbor doesn't exist. offset is
+ * mathematically bounded to (-0.5, 0.5) whenever it's computed (peak_bin has
+ * the largest H[k] of the three by construction), so no extra clamping is
+ * needed.
+ *
+ * @param hps_vals The full HPS array from _hps_peak_bin().
+ * @param peak_bin The winning bin returned by _hps_peak_bin().
+ * @return The interpolated, fractional bin index.
+ */
+static float32_t _parabolic_interpolate(const float32_t hps_vals[HPS_BIN_COUNT],
+                                        uint32_t peak_bin) {
+  float32_t k_true = (float32_t)peak_bin;
+
+  if (peak_bin > BPM_BIN_MIN && peak_bin < BPM_BIN_MAX) {
+    float32_t h_prev = hps_vals[peak_bin - 1U - BPM_BIN_MIN];
+    float32_t h_curr = hps_vals[peak_bin - BPM_BIN_MIN];
+    float32_t h_next = hps_vals[peak_bin + 1U - BPM_BIN_MIN];
+    float32_t denom = h_prev - 2.0f * h_curr + h_next;
+    if (denom != 0.0f) {
+      float32_t offset = 0.5f * (h_prev - h_next) / denom;
+      k_true = (float32_t)peak_bin + offset;
+    }
+  }
+
+  return k_true;
 }
 
 /**
@@ -243,15 +286,15 @@ int xd58c_process(void) {
     lpf_out = _lpf_4Hz(
         hpf_out); // 4th order lpf, fc = 4Hz (removes high frequency noise)
 
-    LOG_INF("raw=%d hpf_out=%d lpf_out=%d", sample, (int)hpf_out,
-            (int)lpf_out);
+    // LOG_INF("raw=%d hpf_out=%d lpf_out=%d", sample, (int)hpf_out,
+    // (int)lpf_out);
 
     _this.fft_ibuf[_this.fft_write_idx++] = (int16_t)lpf_out;
     if (_this.fft_write_idx < FFT_SIZE) {
       continue;
     }
 
-    LOG_INF("process %d", _this.fft_write_idx);
+    // LOG_WRN("process %d", _this.fft_write_idx);
 
     _this.fft_write_idx = 0U;
     mean = 0;
@@ -266,14 +309,26 @@ int xd58c_process(void) {
           ((float32_t)_this.fft_ibuf[i] - mean) * _this.fft_hann[i];
     }
 
-    LOG_INF("out[0]=%d", (int)_this.fft_input[0]);
+    // LOG_INF("out[0]=%d", (int)_this.fft_input[0]);
 
     arm_rfft_fast_f32(&_this.fft_rfft, _this.fft_input, _this.fft_output, 0);
 
+    float32_t hps_vals[HPS_BIN_COUNT] = {};
     float32_t hps_peak = 0.0f;
-    uint32_t peak_bin = _hps_peak_bin(&hps_peak);
+    uint32_t peak_bin = _hps_peak_bin(hps_vals, &hps_peak);
 
-    // LOG_INF("peak_bin=%u hps_peak=%d", peak_bin, (int)hps_peak);
+    float32_t k_true = _parabolic_interpolate(hps_vals, peak_bin);
+
+    uint32_t bpm = (uint32_t)(k_true * (float32_t)(FFT_SAMPLE_RATE * 60U) /
+                                  (float32_t)FFT_SIZE +
+                              0.5f);
+
+    /* hps_peak is a product of 3 squared magnitudes and can reach ~1e20 on
+     * real signals -- print in dB (bounded, ~0-200) instead of a raw (int)
+     * cast, which would silently overflow/UB. */
+    LOG_INF("peak_bin=%u k_true=%d hps_peak_db=%d bpm=%u", peak_bin,
+            (int)(k_true * 100.0f), (int)(10.0f * log10f(hps_peak + 1e-6f)),
+            bpm);
   }
 }
 
