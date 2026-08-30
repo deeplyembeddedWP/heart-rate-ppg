@@ -162,7 +162,7 @@ static void _uart_write_bpm(uint32_t bpm) {
     LOG_ERR("snprintk BPM (err %d)", len);
     return;
   }
-  LOG_INF("BPM:%u", bpm);
+  // LOG_INF("BPM:%u", bpm);
   _uart_send(_this.tx_buf, (size_t)len);
 }
 
@@ -294,8 +294,6 @@ int xd58c_process(void) {
 
     _this.fft_write_idx = 0U;
     mean = 0;
-    memset(hps_vals, 0, sizeof(hps_vals));
-    memset(k_true_sorted, 0, sizeof(k_true_sorted));
 
     for (uint32_t i = 0U; i < FFT_SIZE; i++) { // compute mean for DC removal
       mean += (float32_t)_this.fft_ibuf[i];
@@ -330,6 +328,7 @@ int xd58c_process(void) {
     LOG_INF("peak_bin=%u k_true=%d hps_peak_db=%d bpm_raw=%u bpm=%u", peak_bin,
             (int)(k_true * 100.0f), (int)(10.0f * log10f(hps_peak + 1e-6f)),
             bpm_raw, bpm);
+    //_uart_write_bpm(bpm);
   }
 }
 
