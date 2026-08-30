@@ -2,7 +2,7 @@
 
 Firmware for a heart rate monitor built on the **nRF52840 DK**, using Nordic nRF Connect SDK (NCS) v3.2.0 / Zephyr RTOS 4.2.x.
 
-The application reads photoplethysmography (PPG) data from the **XD58C** pulse sensor via ADC, applies a DC-offset removal filter, and streams AC samples over UART for host-side heart rate processing.
+The application reads photoplethysmography (PPG) data from the **XD58C** pulse sensor via ADC, filters and FFT-analyzes it on-device to estimate heart rate, and streams the resulting BPM over UART.
 
 ## Hardware
 
@@ -10,7 +10,7 @@ The application reads photoplethysmography (PPG) data from the **XD58C** pulse s
 |-----------|--------|
 | SoC | nRF52840 |
 | Board | nRF52840 DK (`nrf52840dk/nrf52840`) |
-| Sensor | XD58C (PPG / heart rate) |
+| Sensor | [XD58C](https://www.keyestudio.com/products/keyestudio-xd-58c-pulse-sensor-module) (PPG / heart rate) |
 | Interface | ADC (async) + UART (async TX) |
 | Logging | Segger RTT (deferred mode) |
 
@@ -33,7 +33,7 @@ dts/bindings/   Custom devicetree bindings
 
 1. `xd58c_init()` — configures the ADC channel at 200 Hz (5 ms interval), registers an async UART callback, and starts continuous ADC sampling.
 2. ADC callback — each raw sample passes through a cascaded 4th-order Butterworth highpass (0.5 Hz) then a cascaded 4th-order Butterworth lowpass (4 Hz) to isolate the cardiac AC waveform, then the result is enqueued. See [Filter frequency response](#filter-frequency-response) below for details.
-3. `xd58c_process()` — dequeues one sample and transmits it as a decimal string (`"<value>\r\n"`) over UART0.
+3. `xd58c_process()` — dequeues samples continuously; once 512 of them (~2.56 s at 200 Hz) have accumulated, it runs an FFT, picks the dominant frequency via Harmonic Product Spectrum, median-filters it over the last 5 blocks, and transmits the result as `"BPM:<value>\r\n"` over UART0.
 4. `main()` calls `xd58c_init()` once, then loops on `xd58c_process()`.
 
 ## Live BPM confidence
@@ -48,41 +48,9 @@ dts/bindings/   Custom devicetree bindings
 
 ## Filter frequency response
 
-`lib/xd58c/xd58c.c` filters every ADC sample through two cascaded biquad filters before it reaches the application:
+The ADC signal passes through a 0.5 Hz highpass (removes DC/drift) then a 4 Hz lowpass (removes high-frequency noise), each a 4th-order Butterworth (2 cascaded biquad sections). 4th order was chosen over a shallower design because the raw signal carries a persistent ~20 Hz interference tone that a 1st/2nd-order rolloff barely touches.
 
-- **`_hpf_0_5Hz`** — 0.5 Hz highpass, removes DC baseline / slow drift.
-- **`_lpf_4Hz`** — 4 Hz lowpass, removes high-frequency noise above the cardiac band.
-
-Together they pass roughly **30–240 BPM** (0.5–4 Hz) with margin around the target 40–230 BPM measurement range.
-
-Both filters are implemented as **2 cascaded biquad sections** (4th-order Butterworth), which was chosen over a single biquad (2nd-order) or a single-pole design (1st-order) specifically for its steeper rolloff — each added order doubles the attenuation slope past the cutoff, at the cost of some added filter state/compute (negligible on the nRF52840) and a slightly slower step response.
-
-| Order | Rolloff | HPF/LPF sections | Notes |
-|-------|---------|-------------------|-------|
-| 1st | 6 dB/octave | single-pole | Fastest to settle, weakest noise rejection — the old DC-tracking approach was roughly equivalent to this |
-| 2nd | 12 dB/octave | 1 biquad | Previous implementation |
-| **4th (current)** | **24 dB/octave** | **2 cascaded biquads** | Current implementation |
-
-### Why 4th order
-
-The sensor's raw ADC signal carries a persistent interference tone around **20 Hz** (plus harmonics at 40/60/80 Hz) — likely PWM, mechanical vibration, or a switching artifact — that sits well outside the 0.5–4 Hz cardiac band but close enough that a shallow rolloff barely touches it. Applying each candidate filter order's theoretical lowpass response to a real captured raw spectrum (`samples.log`, finger-on capture) shows the difference concretely:
-
-![Filter order comparison](docs/filter_order_comparison.png)
-
-![Noise suppression by filter order](docs/filter_order_noise_suppression.png)
-
-Measured attenuation at the interference tone and its harmonics, applying each order's 4 Hz lowpass to the same captured raw spectrum:
-
-| Tone | Raw (dB) | After 1st order | After 2nd order | After 4th order (current) |
-|------|---------:|-----------------:|-----------------:|---------------------------:|
-| 20 Hz (interference) | 9.49 | -4.89 | -18.96 | **-47.40** |
-| 40 Hz (2nd harmonic) | 0.79 | -20.45 | -41.62 | **-84.03** |
-| 60 Hz (3rd harmonic) | -1.07 | -27.93 | -54.76 | **-108.45** |
-| 80 Hz (4th harmonic) | -1.79 | -35.62 | -69.44 | **-137.09** |
-
-At 1st order the 20 Hz interference is only pulled down a few dB, still close to the surrounding floor. At 2nd order it's clearly attenuated but remains a visible bump. At 4th order (current) it's pushed to -47.4 dB — over 55 dB below its raw level and well beneath the noise floor, with the harmonics suppressed even further. This was verified against real hardware captures, not just the analytic model — see the interactive Bode plot / measured PSD below for the live comparison.
-
-**Interactive Bode plot + measured spectrum:** [xd58c Filter Frequency Response](https://claude.ai/code/artifact/59b802e4-a292-4a3a-9cb1-cb7f7538e935) — hover for exact dB values at any frequency, toggle table view, and compare the analytic 4th-order response against a Welch PSD of an actual `samples.log` capture.
+See [`docs/filter-design.md`](docs/filter-design.md) for the order comparison, measured attenuation data, and an interactive Bode plot.
 
 ## Prerequisites
 
@@ -154,13 +122,13 @@ Test results are written to `twister-out/twister.xml` (JUnit format).
 
 ### What is tested
 
-| Test | Description |
-|------|-------------|
-| `test_xd58c_init_success` | Happy path: UART + ADC ready, init returns 0 |
-| `test_xd58c_init_no_uart` | UART not ready → returns `-ENODEV` |
-| `test_xd58c_init_no_adc` | ADC not ready → returns `-ENODEV` |
-| `test_xd58c_init_adc_setup_error` | ADC channel setup fails → returns `-EINVAL` |
-| `test_xd58c_uart_write_format` | Sample enqueued and transmitted as `"<value>\r\n"` |
+| Area | Covers |
+|------|--------|
+| `xd58c_init()` | Happy path, and each failure mode (`-ENODEV` for UART/ADC not ready, `-EINVAL` for ADC channel setup) |
+| `_median_of()` | Unsorted/pre-sorted/all-equal inputs, and rejecting a single octave-error outlier |
+| `_parabolic_interpolate()` | Symmetric and skewed peaks, flat-top (no offset), and both bin-range edges (no interpolation) |
+| `_hps_peak_bin()` | Picks the correct dominant bin from a synthetic spectrum; all-zero spectrum default |
+| Full pipeline | `xd58c_process()` run on its own thread, fed a synthetic tone, verified end-to-end against the `"BPM:%u\r\n"` UART output |
 
 ## CI
 
