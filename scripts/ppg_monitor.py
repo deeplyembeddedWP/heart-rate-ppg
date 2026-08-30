@@ -3,21 +3,12 @@ PPG Heart Rate Monitor
 ======================
 Reads "BPM:xx" lines from the firmware over serial (the nRF52840 already
 computes BPM on-device via FFT + Harmonic Product Spectrum — see
-lib/xd58c/xd58c.c), rolling-averages the last ROLLING_WINDOW readings, and
-displays:
+lib/xd58c/xd58c.c) and displays each reading as-is, with no smoothing or
+outlier rejection:
   • BPM trend
   • Large BPM readout
   • START button  – begins listening and plotting
   • STOP button   – halts, resets all data and plots
-
-Outlier rejection
-------------------
-A reading more than OUTLIER_MAX_JUMP BPM away from the current window's
-average is held back for one reading (catches brief contact-transient/
-signal-loss blips). If OUTLIER_RESET_STREAK consecutive readings disagree
-with the baseline the same way, the window is cleared and reseeded instead —
-the baseline is treated as stale (e.g. a real change, not a glitch), so it
-doesn't reject forever.
 
 Usage
 -----
@@ -48,52 +39,10 @@ from matplotlib.widgets import Button
 BPM_MIN         = 20
 BPM_MAX         = 240
 BPM_HISTORY     = 30   # readings kept for the trend plot
-ROLLING_WINDOW  = 5    # most recent readings averaged for display
-OUTLIER_MAX_JUMP     = 45  # BPM; bigger than one firmware bin (~23.4), smaller
-                            # than contact-transient / signal-loss jumps
-OUTLIER_RESET_STREAK = 3   # consecutive disagreements before the baseline is
-                            # treated as stale and reseeded — loosened from 2
-                            # so early contact-transient jitter doesn't wipe
-                            # the window (and restart the ~6.4s lock count)
-                            # on every other reading
 
-SIGNAL_LOCK_MIN_READINGS = 5  # readings needed to (re)acquire lock. Tried
-                            # decoupling this below ROLLING_WINDOW (3, then 2)
-                            # to speed up relocking after a reseed — but a
-                            # stress test against random no-finger-range
-                            # noise showed false-lock rates of 9-23% at 3-4
-                            # readings (with only a handful of samples,
-                            # "they agree with each other" is weak evidence;
-                            # random draws in a ~200 BPM range collide with
-                            # each other often enough to fake it). At 5
-                            # readings that drops to ~1%, so this stays equal
-                            # to ROLLING_WINDOW — the reseed-buffer fix above
-                            # is what actually speeds up recovery now, not
-                            # this constant
-SIGNAL_LOCK_STDEV   = 12   # max stdev (BPM) across the rolling window to
-                            # *acquire* lock — loosened from 10 (originally
-                            # 6): two readings one FFT bin apart (~23 BPM)
-                            # have stdev ~11.7, which tighter thresholds
-                            # rejected even though that's normal
-                            # bin-quantization jitter, not noise. Verified
-                            # against the false-lock stress test above
-                            # before settling here — much looser (14+)
-                            # measurably raised the false-lock rate
-SIGNAL_UNLOCK_STDEV = 20   # once locked, stdev may rise this far before
-                            # dropping lock — wider than SIGNAL_LOCK_STDEV so
-                            # ordinary reading-to-reading jitter from a good
-                            # placement doesn't flicker the display back to
-                            # "acquiring" every time one noisier sample
-                            # enters the window
-SIGNAL_MIN_BPM    = 30   # wide plausible range, not a tight physiological
-SIGNAL_MAX_BPM    = 220  # one — trained athletes commonly rest in the
-                          # high-30s/low-40s, so a tight floor would flicker
-                          # or refuse to lock on a real, steady reading. The
-                          # stdev/hysteresis check above is what actually
-                          # catches no-finger noise (wildly unstable, not
-                          # just numerically low); this range only exists to
-                          # reject values no human heart rate could plausibly
-                          # produce
+CONFIDENCE_WINDOW     = 5   # recent readings used as the "past trend" baseline
+CONFIDENCE_MAX_DEVIATION = 5   # BPM; a reading further than this from the
+                            # trailing trend mean counts as a deviation
 
 PULSE_MIN_SIZE    = 22   # heart glyph fontsize at rest
 PULSE_MAX_SIZE    = 34   # heart glyph fontsize at the peak of each beat
@@ -132,6 +81,7 @@ C = {
     "subtext":         "#8892aa",
     "bpm_value":       "#2ecc71",
     "bar_track":       "#232a42",
+    "confidence_low":  "#e6484f",
     "btn_start_on":    "#1d9e75",
     "btn_start_hover": "#25c48e",
     "btn_stop_on":     "#e24b4a",
@@ -206,38 +156,25 @@ class PPGMonitor:
     # ── state ─────────────────────────────────────────────────────────────────
     def _reset_state(self):
         self._bpm_times  = collections.deque(maxlen=BPM_HISTORY)
-        self._bpm_values = collections.deque(maxlen=BPM_HISTORY)  # rolling-averaged
-        self._window     = collections.deque(maxlen=ROLLING_WINDOW)  # raw readings
-        self._reject_buf = []  # consecutive readings disagreeing with the
-                                # current baseline; becomes the new window's
-                                # seed if a reseed triggers (see _process_bpm)
+        self._bpm_values = collections.deque(maxlen=BPM_HISTORY)  # raw readings
+        self._trend_ref  = collections.deque(maxlen=CONFIDENCE_WINDOW)  # recent
+                                # raw readings, used only as the trend baseline
+        self._stable_flags = collections.deque(maxlen=CONFIDENCE_WINDOW)  # was
+                                # each of the last CONFIDENCE_WINDOW readings
+                                # within CONFIDENCE_MAX_DEVIATION of the trend
+                                # at the time it arrived?
         self._current_bpm = None
         self._pulse_phase = 0.0   # 0..1 fraction through the current beat cycle
         self._last_frame_time = None
-        self._locked_state = False
 
-    def _signal_locked(self):
-        """Heuristic "is a finger actually on the sensor" gate. The firmware
-        has no contact sensor, so this is inferred from reading behavior: a
-        full window of recent readings that agree tightly and fall in a
-        plausible HR range. Noisy/implausible readings (the common no-finger
-        signature) fail this and suppress the pulse animation + readout.
-
-        Uses hysteresis (SIGNAL_LOCK_STDEV to acquire, wider
-        SIGNAL_UNLOCK_STDEV to stay locked): checking only the current
-        window's stdev against one threshold made the display flicker back
-        to "acquiring" the moment ordinary reading-to-reading jitter — not
-        an actual finger-off event — pushed one window past the threshold."""
-        if len(self._window) < SIGNAL_LOCK_MIN_READINGS:
-            self._locked_state = False
-            return False
-        avg = statistics.mean(self._window)
-        if not (SIGNAL_MIN_BPM <= avg <= SIGNAL_MAX_BPM):
-            self._locked_state = False
-            return False
-        threshold = SIGNAL_UNLOCK_STDEV if self._locked_state else SIGNAL_LOCK_STDEV
-        self._locked_state = statistics.pstdev(self._window) <= threshold
-        return self._locked_state
+    def _confidence(self):
+        """Fraction (0.0-1.0) of the last CONFIDENCE_WINDOW readings that
+        stayed within CONFIDENCE_MAX_DEVIATION BPM of the trend mean at the
+        time they arrived -- i.e. how stable the BPM trend has been recently.
+        None until there's at least one such comparison to judge."""
+        if not self._stable_flags:
+            return None
+        return sum(self._stable_flags) / len(self._stable_flags)
 
     @staticmethod
     def _pulse_shape(phase):
@@ -255,41 +192,18 @@ class PPGMonitor:
         return total
 
     def _process_bpm(self, raw_bpm):
-        """Receive one BPM reading from the firmware, reject transient
-        outliers, rolling-average the last ROLLING_WINDOW readings, and store
-        the result for display."""
-        if self._window:
-            baseline = statistics.mean(self._window)
-            if abs(raw_bpm - baseline) > OUTLIER_MAX_JUMP:
-                self._reject_buf.append(raw_bpm)
-                if len(self._reject_buf) < OUTLIER_RESET_STREAK:
-                    return  # one-off transient: reject, hold last displayed value
-                # Multiple consecutive disagreements — the baseline is stale
-                # (a real change), not the incoming readings. Reseed using
-                # the disagreeing readings themselves (not just append the
-                # current one to an empty window): they already agree with
-                # each other, so the new baseline isn't built from a single
-                # possibly-noisy sample that could then reject every good
-                # reading that follows it and stall recovery indefinitely.
-                self._window.clear()
-                self._window.extend(self._reject_buf)
-                self._reject_buf.clear()
-                avg = statistics.mean(self._window)
-                elapsed = time.perf_counter() - self._start_time
-                self._bpm_times.append(elapsed)
-                self._bpm_values.append(avg)
-                self._current_bpm = avg
-                return
-            else:
-                self._reject_buf.clear()
-
-        self._window.append(raw_bpm)
-        avg = statistics.mean(self._window)
+        """Receive one BPM reading from the firmware and store it directly
+        for display, with no smoothing or outlier rejection. Separately,
+        check it against the trailing trend for the confidence readout."""
+        if self._trend_ref:
+            trend = statistics.mean(self._trend_ref)
+            self._stable_flags.append(abs(raw_bpm - trend) <= CONFIDENCE_MAX_DEVIATION)
+        self._trend_ref.append(raw_bpm)
 
         elapsed = time.perf_counter() - self._start_time
         self._bpm_times.append(elapsed)
-        self._bpm_values.append(avg)
-        self._current_bpm = avg
+        self._bpm_values.append(raw_bpm)
+        self._current_bpm = raw_bpm
 
     # ── UI ────────────────────────────────────────────────────────────────────
     def _build_ui(self):
@@ -403,10 +317,11 @@ class PPGMonitor:
             ha="center", va="center", transform=self.ax_num.transAxes,
             fontsize=13, color=C["subtext"])
 
-        # stability bar — stands in for the old "confidence" readout; fills
-        # as the rolling window populates rather than a modelled confidence
-        self._txt_stability = self.ax_num.text(
-            0.5, 0.155, "stability 0.00",
+        # confidence bar — fraction of the last CONFIDENCE_WINDOW readings
+        # that stayed within CONFIDENCE_MAX_DEVIATION BPM of the trailing
+        # trend, i.e. how stable the BPM trend has been recently
+        self._txt_confidence = self.ax_num.text(
+            0.5, 0.155, "confidence --",
             ha="center", va="center", transform=self.ax_num.transAxes,
             fontsize=9, color=C["subtext"])
         self._bar_x0, self._bar_w = 0.18, 0.64
@@ -527,7 +442,8 @@ class PPGMonitor:
         self._txt_pulse.set_alpha(0.25)
         self._txt_pulse.set_color(C["subtext"])
         self._bar_fill.set_width(0.0)
-        self._txt_stability.set_text("stability 0.00")
+        self._txt_confidence.set_text("confidence --")
+        self._txt_confidence.set_color(C["subtext"])
 
     # ── animation ─────────────────────────────────────────────────────────────
     def _update(self, _frame):
@@ -549,16 +465,6 @@ class PPGMonitor:
             self.ax_bpm.set_ylim(max(BPM_MIN, min(ys) - 10),
                                  min(BPM_MAX, max(ys) + 10))
 
-        # NOTE: this used to be gated behind _signal_locked() (a stdev/
-        # range/min-readings heuristic meant to detect "no finger on the
-        # sensor"). Without real hardware to calibrate against, several
-        # rounds of tuning that heuristic either let noise through as a
-        # false lock, or made real, finger-placed readings rarely lock at
-        # all — the latter is a worse failure mode (broken core feature)
-        # than the former (a cosmetic pulse animating during no-finger
-        # noise), so the gate is disabled: show whatever the rolling
-        # average says as soon as there's a reading. _signal_locked() is
-        # left defined in case this gets revisited with real data.
         locked = self._current_bpm is not None
 
         self._txt_pulse_status.set_text("" if locked else "waiting for signal…")
@@ -571,10 +477,20 @@ class PPGMonitor:
             self._txt_bpm.set_text("--")
             self._txt_bpm.set_color(C["subtext"])
 
-        # stability bar — fraction of the rolling window currently populated
-        fill_frac = min(len(self._window), ROLLING_WINDOW) / ROLLING_WINDOW
-        self._bar_fill.set_width(self._bar_w * fill_frac)
-        self._txt_stability.set_text(f"stability {fill_frac:.2f}")
+        # confidence bar — how stable the BPM trend has been recently
+        confidence = self._confidence()
+        if confidence is None:
+            self._bar_fill.set_width(0.0)
+            self._txt_confidence.set_text("confidence --")
+            self._txt_confidence.set_color(C["subtext"])
+        else:
+            self._bar_fill.set_width(self._bar_w * confidence)
+            self._bar_fill.set_facecolor(
+                C["bpm_value"] if confidence >= 0.5 else C["confidence_low"])
+            label = "low" if confidence < 0.5 else f"{confidence:.2f}"
+            self._txt_confidence.set_text(f"confidence {label}")
+            self._txt_confidence.set_color(
+                C["text"] if confidence >= 0.5 else C["confidence_low"])
 
         # pulse — simulated at the current BPM rate, not detected per-beat
         # (the firmware only reports a periodic aggregate, not individual
