@@ -1,5 +1,8 @@
 # Heart Rate Monitor
 
+[![CI](https://github.com/vinay-divakar/heart-rate-monitor/actions/workflows/ci.yml/badge.svg)](https://github.com/vinay-divakar/heart-rate-monitor/actions/workflows/ci.yml)
+[![License: Apache 2.0](https://img.shields.io/github/license/vinay-divakar/heart-rate-monitor)](LICENSE)
+
 Firmware for a heart rate monitor built on the **nRF52840 DK**, using Nordic nRF Connect SDK (NCS) v3.2.0 / Zephyr RTOS 4.2.x.
 
 The application reads photoplethysmography (PPG) data from the **XD58C** pulse sensor via ADC, filters and FFT-analyzes it on-device to estimate heart rate, and streams the resulting BPM over UART.
