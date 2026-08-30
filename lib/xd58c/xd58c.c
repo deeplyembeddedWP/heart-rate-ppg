@@ -263,6 +263,26 @@ static float32_t _parabolic_interpolate(const float32_t hps_vals[HPS_BIN_COUNT],
   return k_true;
 }
 
+#define BPM_MEDIAN_WINDOW 5U
+
+/**
+ * @brief Median of the first n entries of vals, sorting a local copy in
+ * place. n is always BPM_MEDIAN_WINDOW (5) once warmed up, so an O(n^2)
+ * insertion sort is simpler than a real sort routine for no real cost.
+ */
+static float32_t _median_of(float32_t vals[], uint32_t n) {
+  for (uint32_t i = 1U; i < n; i++) {
+    float32_t key = vals[i];
+    int32_t j = (int32_t)i - 1;
+    while (j >= 0 && vals[j] > key) {
+      vals[j + 1] = vals[j];
+      j--;
+    }
+    vals[j + 1] = key;
+  }
+  return vals[n / 2U];
+}
+
 /**
  * @brief Fetches a sample from the message queue, filters it, and either
  * transmits it directly or buffers it for block FFT/BPM processing.
@@ -319,16 +339,29 @@ int xd58c_process(void) {
 
     float32_t k_true = _parabolic_interpolate(hps_vals, peak_bin);
 
-    uint32_t bpm = (uint32_t)(k_true * (float32_t)(FFT_SAMPLE_RATE * 60U) /
+    static float32_t s_k_true_hist[BPM_MEDIAN_WINDOW] = {};
+    static uint32_t s_k_true_idx = 0U;
+
+    s_k_true_hist[s_k_true_idx] = k_true;
+    s_k_true_idx = (s_k_true_idx + 1U) % BPM_MEDIAN_WINDOW;
+
+    float32_t k_true_sorted[BPM_MEDIAN_WINDOW] = {};
+    memcpy(k_true_sorted, s_k_true_hist, sizeof(k_true_sorted));
+    float32_t k_true_med = _median_of(k_true_sorted, BPM_MEDIAN_WINDOW);
+
+    uint32_t bpm_raw = (uint32_t)(k_true * (float32_t)(FFT_SAMPLE_RATE * 60U) /
+                                      (float32_t)FFT_SIZE +
+                                  0.5f);
+    uint32_t bpm = (uint32_t)(k_true_med * (float32_t)(FFT_SAMPLE_RATE * 60U) /
                                   (float32_t)FFT_SIZE +
                               0.5f);
 
     /* hps_peak is a product of 3 squared magnitudes and can reach ~1e20 on
      * real signals -- print in dB (bounded, ~0-200) instead of a raw (int)
      * cast, which would silently overflow/UB. */
-    LOG_INF("peak_bin=%u k_true=%d hps_peak_db=%d bpm=%u", peak_bin,
+    LOG_INF("peak_bin=%u k_true=%d hps_peak_db=%d bpm_raw=%u bpm=%u", peak_bin,
             (int)(k_true * 100.0f), (int)(10.0f * log10f(hps_peak + 1e-6f)),
-            bpm);
+            bpm_raw, bpm);
   }
 }
 
