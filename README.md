@@ -2,7 +2,9 @@
 
 Firmware for a heart rate monitor built on the **nRF52840 DK**, using Nordic nRF Connect SDK (NCS) v3.2.0 / Zephyr RTOS 4.2.x.
 
-The application reads photoplethysmography (PPG) data from the **XD58C** pulse sensor via ADC, applies a DC-offset removal filter, and streams AC samples over UART for host-side heart rate processing.
+The application reads photoplethysmography (PPG) data from the **XD58C** pulse sensor via ADC, filters and FFT-analyzes it on-device to estimate heart rate, and streams the resulting BPM over UART.
+
+See [`CHANGELOG.md`](CHANGELOG.md) for what's new in each version.
 
 ## Hardware
 
@@ -10,7 +12,7 @@ The application reads photoplethysmography (PPG) data from the **XD58C** pulse s
 |-----------|--------|
 | SoC | nRF52840 |
 | Board | nRF52840 DK (`nrf52840dk/nrf52840`) |
-| Sensor | XD58C (PPG / heart rate) |
+| Sensor | [XD58C](https://www.keyestudio.com/products/keyestudio-xd-58c-pulse-sensor-module) (PPG / heart rate) |
 | Interface | ADC (async) + UART (async TX) |
 | Logging | Segger RTT (deferred mode) |
 
@@ -32,9 +34,25 @@ dts/bindings/   Custom devicetree bindings
 ## How it works
 
 1. `xd58c_init()` — configures the ADC channel at 200 Hz (5 ms interval), registers an async UART callback, and starts continuous ADC sampling.
-2. ADC callback — on each sample, subtracts a running DC estimate (single-pole IIR high-pass, shift = 5) to extract the AC pulse waveform, then enqueues the result.
-3. `xd58c_process()` — dequeues one sample and transmits it as a decimal string (`"<value>\r\n"`) over UART0.
+2. ADC callback — each raw sample passes through a cascaded 4th-order Butterworth highpass (0.5 Hz) then a cascaded 4th-order Butterworth lowpass (4 Hz) to isolate the cardiac AC waveform, then the result is enqueued. See [Filter frequency response](#filter-frequency-response) below for details.
+3. `xd58c_process()` — dequeues samples continuously; once 512 of them (~2.56 s at 200 Hz) have accumulated, it runs an FFT, picks the dominant frequency via Harmonic Product Spectrum, median-filters it over the last 5 blocks, and transmits the result as `"BPM:<value>\r\n"` over UART0.
 4. `main()` calls `xd58c_init()` once, then loops on `xd58c_process()`.
+
+## Live BPM confidence
+
+`scripts/ppg_monitor.py` shows a **confidence** score next to the live BPM, based on how stable recent readings are relative to their own trend — not a measure of skin contact or signal quality directly. Each new reading is compared to the mean of the last 5; confidence is the fraction of the last 5 that landed within ±5 BPM of that mean. ≥0.5 shows green with the score, below that shows red "confidence low".
+
+**Expect ~15–20 seconds** after placing a finger before confidence reliably locks onto the true rate — the FFT-based estimate needs a few ~2.56 s blocks to fill its median filter and reject initial octave-error blips. A drop back to low confidence (e.g. lifting the finger) is reported within a couple of readings.
+
+| Locking on | Locked, steady | Signal lost |
+|---|---|---|
+| ![Locking on](docs/ppg_confidence_locking.png) | ![Steady, high confidence](docs/ppg_confidence_steady.png) | ![Low confidence](docs/ppg_confidence_low.png) |
+
+## Filter frequency response
+
+The ADC signal passes through a 0.5 Hz highpass (removes DC/drift) then a 4 Hz lowpass (removes high-frequency noise), each a 4th-order Butterworth (2 cascaded biquad sections). 4th order was chosen over a shallower design because the raw signal carries a persistent ~20 Hz interference tone that a 1st/2nd-order rolloff barely touches.
+
+See [`docs/filter-design.md`](docs/filter-design.md) for the order comparison, measured attenuation data, and an interactive Bode plot.
 
 ## Prerequisites
 
@@ -106,114 +124,13 @@ Test results are written to `twister-out/twister.xml` (JUnit format).
 
 ### What is tested
 
-| Test | Description |
-|------|-------------|
-| `test_xd58c_init_success` | Happy path: UART + ADC ready, init returns 0 |
-| `test_xd58c_init_no_uart` | UART not ready → returns `-ENODEV` |
-| `test_xd58c_init_no_adc` | ADC not ready → returns `-ENODEV` |
-| `test_xd58c_init_adc_setup_error` | ADC channel setup fails → returns `-EINVAL` |
-| `test_xd58c_uart_write_format` | Sample enqueued and transmitted as `"<value>\r\n"` |
-
-## Host-side monitor script
-
-`scripts/ppg_monitor.py` is a Python GUI that receives the AC samples streamed by the firmware, computes heart rate in real time, and plots the results.
-
-### What it shows
-
-| Panel | Description |
-|-------|-------------|
-| **PPG Waveform** | 8-second scrolling window — `ac_ppg` trace (blue, α 0.5) overlaid with the 0.7–3.5 Hz bandpass-filtered signal (green); detected beats marked with orange dots |
-| **BPM Trend** | Rolling history of up to 30 beat-per-minute estimates plotted as a line graph |
-| **BPM Readout** | Large numeric display coloured by confidence: green ≥ 0.50, amber ≥ 0.15, red < 0.15; a bar beneath shows the raw confidence value |
-
-### UI
-
-**Idle — waiting for START**
-
-![Idle state](docs/ui_idle.png)
-
-On launch the waveform panel shows a flat line with the prompt *"Press ► START to begin measurement"*. The BPM readout is blank and the STOP button is disabled. Press **START** (green button) to open the serial port and begin streaming.
-
----
-
-**Early acquisition — BPM trend building**
-
-![Early running state](docs/ui_running_early.png)
-
-A few seconds after pressing START, the filtered PPG waveform (green) and raw signal (blue) scroll across the top panel. Detected heartbeats are marked with orange dots. The BPM Trend chart shows the first few autocorrelation windows, and the large readout on the right updates with the current estimate (77 BPM here) along with a confidence bar.
-
----
-
-**Steady state — full trend history**
-
-![Steady running state](docs/ui_running_steady.png)
-
-After ~30 windows (~15 s) the BPM Trend fills out into a continuous history. Beat detection is stable, the confidence score (0.66–0.68) is consistent, and the readout colour remains green. Press **STOP** (red button) to halt acquisition and reset all plots.
-
----
-
-### Algorithm
-
-1. **Bandpass filter** — 4th-order Butterworth, 0.7–3.5 Hz, applied with `filtfilt` (zero phase).
-2. **Autocorrelation BPM** — every 0.5 s a 4-second sliding window is autocorrelated; the dominant lag in the 40–180 BPM range gives the estimate and its normalised peak height is used as confidence.
-3. **Peak detection** — `scipy.signal.find_peaks` with a minimum inter-peak distance of 60/180 Hz and a prominence threshold of 0.4 σ, used for beat markers only.
-
-### Usage
-
-```bash
-# Live mode — connect nRF52840 DK via USB and find the port
-python scripts/ppg_monitor.py --port /dev/ttyUSB0 --baud 1000000
-
-# Replay mode — use a saved ODS recording
-python scripts/ppg_monitor.py --replay scripts/ppg_recordings.ods
-
-# Replay at 2× speed
-python scripts/ppg_monitor.py --replay scripts/ppg_recordings.ods --speed 2
-```
-
-### Dependencies
-
-```bash
-pip install numpy scipy matplotlib pandas pyserial odfpy openpyxl
-```
-
----
-
-## Recording dataset — `scripts/ppg_recordings.ods`
-
-Two-subject ODS recording captured from the nRF52840 DK + XD58C sensor at 200 Hz.
-
-### Column definitions
-
-| Column | Name | Description |
-|--------|------|-------------|
-| A | `ac_ppg` | AC-coupled PPG signal — firmware single-pole IIR high-pass filter output (SHIFT = 6, ~0.50 Hz cutoff). This is the signal streamed via UART and used for heart rate calculation. Small amplitude (±40 counts). |
-| B | `raw_adc` | Raw ADC photosensor reading — DC-coupled, before any firmware filtering. Large amplitude with slow drift (hundreds of counts). Useful for signal quality assessment. |
-
-### Dataset summary
-
-| Sheet | `ac_ppg` samples | `raw_adc` samples | Duration (AC / Raw) | Detected beats | Mean HR (autocorr) | Mean confidence |
-|-------|-----------------|-------------------|---------------------|----------------|-------------------|-----------------|
-| `subject-1` | 1 043 | 2 133 | 5.2 s / 10.7 s | 9 | ~57 BPM | 0.37 |
-| `subject-2` | 1 654 | 4 950 | 8.3 s / 24.8 s | 15 | ~47 BPM | 0.32 |
-
-### Signal plots
-
-#### Subject 1
-![Subject 1 PPG analysis](docs/ppg_subject_1.png)
-
-#### Subject 2
-![Subject 2 PPG analysis](docs/ppg_subject_2.png)
-
-### Key insights
-
-**Signal pipeline.** The `raw_adc` column shows the DC-biased photosensor output with slow baseline wander (the vertical dashed line marks where the `ac_ppg` recording ends — the Raw ADC logger ran longer). The firmware IIR HPF removes the DC offset, producing the `ac_ppg` column. The Python bandpass filter (0.7–3.5 Hz) then narrows the cardiac band and removes residual low-frequency drift, yielding clean beat peaks for detection.
-
-**Heart rate estimates.** The autocorrelation method consistently estimates ~47–57 BPM across both subjects — a plausible resting heart rate. Beat-to-beat interval counting from peak detection gives higher raw numbers (~113–118 BPM) because the dicrotic notch (secondary pressure wave after the main systolic peak) is sometimes detected as a second beat. The autocorrelation approach is more robust to this artefact.
-
-**Confidence.** Mean confidence scores of 0.32–0.37 (moderate) reflect the short recording windows (5–8 s). Confidence is expected to improve beyond 0.50 once the autocorrelation window accumulates ≥ 10 cardiac cycles (~10 s at 60 BPM). Green dots in the autocorrelation panel mark windows where confidence ≥ 0.50; amber where ≥ 0.15.
-
-**Subject 2 has a lower baseline drift** in `raw_adc` (std = 454 vs 107 for subject 1), suggesting more finger motion or a looser sensor contact during that session. The `ac_ppg` amplitude is comparable between subjects (std ≈ 10–12 counts), confirming the firmware HPF successfully removes the DC component regardless.
+| Area | Covers |
+|------|--------|
+| `xd58c_init()` | Happy path, and each failure mode (`-ENODEV` for UART/ADC not ready, `-EINVAL` for ADC channel setup) |
+| `_median_of()` | Unsorted/pre-sorted/all-equal inputs, and rejecting a single octave-error outlier |
+| `_parabolic_interpolate()` | Symmetric and skewed peaks, flat-top (no offset), and both bin-range edges (no interpolation) |
+| `_hps_peak_bin()` | Picks the correct dominant bin from a synthetic spectrum; all-zero spectrum default |
+| Full pipeline | `xd58c_process()` run on its own thread, fed a synthetic tone, verified end-to-end against the `"BPM:%u\r\n"` UART output |
 
 ## CI
 

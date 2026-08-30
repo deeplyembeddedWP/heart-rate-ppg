@@ -1,76 +1,87 @@
 """
 PPG Heart Rate Monitor
 ======================
-Reads AC samples from a serial port (or replays an ODS file for testing),
-applies a bandpass filter + sliding-window autocorrelation, and displays:
-  • Live PPG waveform (raw + filtered)
-  • Beat-to-beat BPM trend
-  • Large BPM readout with confidence indicator
-  • START button  – begins data acquisition and plotting
-  • STOP button   – halts acquisition, resets all data and plots
+Reads "BPM:xx" lines from the firmware over serial (the nRF52840 already
+computes BPM on-device via FFT + Harmonic Product Spectrum — see
+lib/xd58c/xd58c.c) and displays each reading as-is, with no smoothing or
+outlier rejection:
+  • BPM trend
+  • Large BPM readout
+  • START button  – begins listening and plotting
+  • STOP button   – halts, resets all data and plots
 
 Usage
 -----
-  # Live mode  (UART @ 200 Hz, one int16 per line)
   python ppg_monitor.py --port /dev/ttyUSB0 --baud 1000000
-
-  # Replay mode  (simulate live feed from ODS file)
-  python ppg_monitor.py --replay ppg_recordings.ods
-
-  # Replay at a custom speed multiplier (e.g. 2x faster)
-  python ppg_monitor.py --replay ppg_recordings.ods --speed 2
-
-Dependencies
-------------
-  pip install numpy scipy matplotlib pandas pyserial odfpy openpyxl
 
 Firmware assumptions
 --------------------
-  fs = 200 Hz  (5 ms sampling interval)
-  SHIFT = 6    -> HPF cutoff ~0.50 Hz (below cardiac band floor of 0.7 Hz)
-  UART format: one signed integer per line, e.g. "-42\n"
-  ODS column "ac_ppg"  — firmware IIR HPF output (AC-coupled PPG, small amplitude).
-  ODS column "raw_adc" — raw ADC reading before any firmware filtering (DC-coupled).
+  UART format: "BPM:xx\\r\\n" per HPS update (~every 1.28 s once warmed up).
+  Non-BPM lines are ignored.
 """
 
 import argparse
 import collections
+import math
+import statistics
 import sys
 import threading
 import time
 
-import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+import matplotlib.patches as mpatches
 from matplotlib.animation import FuncAnimation
+from matplotlib.ticker import MultipleLocator
 from matplotlib.widgets import Button
-from scipy.signal import butter, filtfilt, find_peaks
 
 # ── constants ────────────────────────────────────────────────────────────────
-FS          = 200
-BPF_LO      = 0.7
-BPF_HI      = 3.5
-BPF_ORDER   = 4
-WIN_SEC     = 4
-HOP_SEC     = 0.5
-DISP_SEC    = 8
-BPM_MIN     = 40
-BPM_MAX     = 180
-CONF_THRESH = 0.15
-BPM_HISTORY = 30
+BPM_MIN         = 20
+BPM_MAX         = 240
+BPM_HISTORY     = 30   # readings kept for the trend plot
+
+CONFIDENCE_WINDOW     = 5   # recent readings used as the "past trend" baseline
+CONFIDENCE_MAX_DEVIATION = 5   # BPM; a reading further than this from the
+                            # trailing trend mean counts as a deviation
+
+PULSE_MIN_SIZE    = 22   # heart glyph fontsize at rest
+PULSE_MAX_SIZE    = 34   # heart glyph fontsize at the peak of each beat
+
+# Shape of one beat: a classic ECG PQRST complex — small P wave, a sharp
+# QRS spike (with a dip just before and a deeper dip just after, both below
+# baseline), a rounded T wave, then a flat isoelectric segment. Modelled as
+# a sum of Gaussian bumps, each (phase center, width, amplitude relative to
+# the R peak's 1.0); amplitude is negative for the below-baseline dips.
+PULSE_ECG_COMPONENTS = [
+    (0.10,  0.045, 0.15),   # P wave
+    (0.215, 0.010, -0.12),  # Q dip
+    (0.25,  0.012,  1.0),   # R spike
+    (0.29,  0.020, -0.32),  # S dip
+    (0.50,  0.09,   0.28),  # T wave
+]
+
+PULSE_WINDOW_SEC  = 4.0  # width of the scrolling pulse-waveform strip
+PULSE_STRIP_POINTS = 240 # the strip is regenerated analytically at this
+                          # fixed resolution every frame, so it stays smooth
+                          # regardless of actual animation-timer jitter —
+                          # like a hospital monitor's sweep, not a live plot
+                          # that accretes one point per tick
 
 C = {
-    "raw":             "#378add",
-    "filtered":        "#1d9e75",
-    "peaks":           "#ef9f27",
-    "bpm_line":        "#e24b4a",
-    "bg":              "#0e1117",
-    "panel":           "#1a1f2e",
-    "text":            "#e0e4ef",
+    "bpm_line":        "#e6484f",
+    "pulse":           "#e6484f",
+    "pulse_trace":     "#00e0ff",
+    "pulse_trace_core": "#e8feff",
+    "pulse_bg":        "#000000",
+    "pulse_grid":      "#0f4c66",
+    "bg":              "#0a0e1a",
+    "panel":           "#141a2c",
+    "panel_edge":      "#232a42",
+    "text":            "#f0f2fa",
     "subtext":         "#8892aa",
-    "conf_ok":         "#1d9e75",
-    "conf_low":        "#ef9f27",
-    "conf_bad":        "#e24b4a",
+    "bpm_value":       "#2ecc71",
+    "bar_track":       "#232a42",
+    "confidence_low":  "#e6484f",
     "btn_start_on":    "#1d9e75",
     "btn_start_hover": "#25c48e",
     "btn_stop_on":     "#e24b4a",
@@ -79,50 +90,10 @@ C = {
     "btn_txt":         "#e0e4ef",
 }
 
-# ── DSP helpers ───────────────────────────────────────────────────────────────
-def make_bandpass(fs=FS):
-    b, a = butter(BPF_ORDER,
-                  [BPF_LO / (fs / 2), BPF_HI / (fs / 2)],
-                  btype="band")
-    return b, a
 
-
-def autocorr_bpm(samples, fs=FS):
-    """Return (bpm, confidence) or (None, 0.0) on failure."""
-    if len(samples) < fs * 2:
-        return None, 0.0
-    b, a = make_bandpass(fs)
-    try:
-        x = filtfilt(b, a, samples)
-    except Exception:
-        return None, 0.0
-    x -= x.mean()
-    ac = np.correlate(x, x, mode="full")
-    n  = len(x)
-    ac = ac[n - 1:]
-    if ac[0] == 0:
-        return None, 0.0
-    ac /= ac[0]
-    lo_lag = int(fs * 60 / BPM_MAX)
-    hi_lag = min(int(fs * 60 / BPM_MIN), len(ac) - 1)
-    if lo_lag >= hi_lag:
-        return None, 0.0
-    lag = lo_lag + int(np.argmax(ac[lo_lag:hi_lag]))
-    return fs * 60.0 / lag, float(ac[lag])
-
-
-def detect_peaks(filtered, fs=FS):
-    min_dist   = int(fs * 60 / BPM_MAX)
-    prominence = np.std(filtered) * 0.4
-    if prominence == 0:
-        return np.array([], dtype=int)
-    pks, _ = find_peaks(filtered, distance=min_dist, prominence=prominence)
-    return pks
-
-
-# ── data sources ──────────────────────────────────────────────────────────────
+# ── data source ──────────────────────────────────────────────────────────────
 class SerialSource:
-    """Reads one integer per line from a UART port in a background thread."""
+    """Reads "BPM:xx" lines from a UART port in a background thread."""
 
     def __init__(self, port, baud):
         import serial
@@ -136,11 +107,16 @@ class SerialSource:
         while True:
             try:
                 line = self._ser.readline().decode("ascii", errors="ignore").strip()
-                if line:
-                    with self._lock:
-                        self._q.append(int(line))
-            except (ValueError, OSError):
-                pass
+            except OSError:
+                continue
+            if not line.startswith("BPM:"):
+                continue
+            try:
+                bpm = int(line[4:])
+            except ValueError:
+                continue
+            with self._lock:
+                self._q.append(bpm)
 
     def drain(self):
         with self._lock:
@@ -158,180 +134,221 @@ class SerialSource:
             self._q.clear()
 
 
-class ReplaySource:
-    """
-    Replays an ODS file at the correct sample rate.
-    drain() returns [] until start() is called.
-    reset() rewinds to the beginning.
-    """
-
-    def __init__(self, path, speed=1.0):
-        import pandas as pd
-        df = pd.read_excel(path, engine="odf", header=0)
-        col = "ac_ppg" if "ac_ppg" in df.columns else df.columns[0]
-        self._data     = df[col].dropna().values.astype(float)
-        self._speed    = speed
-        self._interval = 1.0 / (FS * speed)
-        self._idx      = 0
-        self._last_t   = None   # None = paused
-
-    def start(self):
-        self._last_t = time.perf_counter()
-
-    def reset(self):
-        self._idx    = 0
-        self._last_t = None
-
-    def drain(self):
-        if self._last_t is None:
-            return []
-        now     = time.perf_counter()
-        elapsed = now - self._last_t
-        n       = int(elapsed / self._interval)
-        if n == 0:
-            return []
-        self._last_t += n * self._interval
-        end   = min(self._idx + n, len(self._data))
-        chunk = self._data[self._idx:end].tolist()
-        self._idx = end
-        if self._idx >= len(self._data):
-            self._idx = 0   # loop
-        return chunk
-
-
 # ── main application ──────────────────────────────────────────────────────────
 class PPGMonitor:
 
     def __init__(self, source):
         self.source     = source
-        self.fs         = FS
         self._measuring = False
-
-        self._disp_len = int(DISP_SEC * FS)
-        self._win_len  = int(WIN_SEC  * FS)
-        self._hop_len  = int(HOP_SEC  * FS)
-        self._b, self._a = make_bandpass(FS)
+        self._start_time = None
 
         self._reset_state()
         self._build_ui()
 
         self._anim = FuncAnimation(
             self.fig, self._update,
-            interval=50,
+            interval=20,  # smoother pulse animation; new BPM data still only
+                          # arrives every ~1.28s regardless of this rate
             blit=False,
             cache_frame_data=False,
         )
 
     # ── state ─────────────────────────────────────────────────────────────────
     def _reset_state(self):
-        self._raw_buf  = collections.deque([0.0] * self._disp_len,
-                                           maxlen=self._disp_len)
-        self._flt_buf  = collections.deque([0.0] * self._disp_len,
-                                           maxlen=self._disp_len)
-        self._all_raw  = collections.deque(maxlen=self._win_len)
-
         self._bpm_times  = collections.deque(maxlen=BPM_HISTORY)
-        self._bpm_values = collections.deque(maxlen=BPM_HISTORY)
-        self._bpm_confs  = collections.deque(maxlen=BPM_HISTORY)
+        self._bpm_values = collections.deque(maxlen=BPM_HISTORY)  # raw readings
+        self._trend_ref  = collections.deque(maxlen=CONFIDENCE_WINDOW)  # recent
+                                # raw readings, used only as the trend baseline
+        self._stable_flags = collections.deque(maxlen=CONFIDENCE_WINDOW)  # was
+                                # each of the last CONFIDENCE_WINDOW readings
+                                # within CONFIDENCE_MAX_DEVIATION of the trend
+                                # at the time it arrived?
+        self._current_bpm = None
+        self._pulse_phase = 0.0   # 0..1 fraction through the current beat cycle
+        self._last_frame_time = None
 
-        self._current_bpm  = None
-        self._current_conf = 0.0
-        self._hop_counter  = 0
-        self._sample_count = 0
+    def _confidence(self):
+        """Fraction (0.0-1.0) of the last CONFIDENCE_WINDOW readings that
+        stayed within CONFIDENCE_MAX_DEVIATION BPM of the trend mean at the
+        time they arrived -- i.e. how stable the BPM trend has been recently.
+        None until there's at least one such comparison to judge."""
+        if not self._stable_flags:
+            return None
+        return sum(self._stable_flags) / len(self._stable_flags)
+
+    @staticmethod
+    def _pulse_shape(phase):
+        """Amplitude at `phase` (0..1) through one beat cycle: a classic ECG
+        PQRST complex, built as a sum of Gaussian bumps (PULSE_ECG_COMPONENTS)
+        — most of the cycle sits flat at the isoelectric baseline (0)."""
+        total = 0.0
+        for center, width, amp in PULSE_ECG_COMPONENTS:
+            d = phase - center
+            if d > 0.5:
+                d -= 1.0
+            elif d < -0.5:
+                d += 1.0
+            total += amp * math.exp(-(d / width) ** 2)
+        return total
+
+    def _process_bpm(self, raw_bpm):
+        """Receive one BPM reading from the firmware and store it directly
+        for display, with no smoothing or outlier rejection. Separately,
+        check it against the trailing trend for the confidence readout."""
+        if self._trend_ref:
+            trend = statistics.mean(self._trend_ref)
+            self._stable_flags.append(abs(raw_bpm - trend) <= CONFIDENCE_MAX_DEVIATION)
+        self._trend_ref.append(raw_bpm)
+
+        elapsed = time.perf_counter() - self._start_time
+        self._bpm_times.append(elapsed)
+        self._bpm_values.append(raw_bpm)
+        self._current_bpm = raw_bpm
 
     # ── UI ────────────────────────────────────────────────────────────────────
     def _build_ui(self):
         plt.style.use("dark_background")
-        self.fig = plt.figure(figsize=(13, 8), facecolor=C["bg"])
+        self.fig = plt.figure(figsize=(10, 6), facecolor=C["bg"])
         self.fig.canvas.manager.set_window_title("PPG Heart Rate Monitor")
 
-        # plots occupy the top 80 %; bottom 18 % is the button strip
         gs = gridspec.GridSpec(
             2, 2,
             figure=self.fig,
-            left=0.06, right=0.97,
-            top=0.93,  bottom=0.18,
-            hspace=0.45, wspace=0.3,
+            left=0.08, right=0.96,
+            top=0.88,  bottom=0.22,
+            wspace=0.3, hspace=0.4,
+            height_ratios=[1, 1.8],
+            width_ratios=[2.3, 1],
         )
 
-        # waveform ────────────────────────────────────────────────────────────
-        self.ax_wave = self.fig.add_subplot(gs[0, :])
-        self._style_ax(self.ax_wave, "PPG Waveform", ylabel="ADC counts")
-        self.ax_wave.grid(color="#2a2f45", linewidth=0.5)
+        # pulse waveform — styled like a hospital ECG monitor: black
+        # background, bright blue graph-paper grid, glowing cyan trace ──
+        self.ax_pulse = self.fig.add_subplot(gs[0, 0])
+        self._style_ax(self.ax_pulse, "Pulse")
+        self._round_card(self.ax_pulse, facecolor=C["pulse_bg"])
+        self.ax_pulse.set_ylim(-0.55, 1.15)
+        self.ax_pulse.set_xlim(0, PULSE_WINDOW_SEC)
+        self.ax_pulse.xaxis.set_major_locator(MultipleLocator(0.4))
+        self.ax_pulse.yaxis.set_major_locator(MultipleLocator(0.2))
+        self.ax_pulse.tick_params(length=0, labelbottom=False, labelleft=False)
+        self.ax_pulse.grid(True, color=C["pulse_grid"], linewidth=0.7, alpha=0.9)
+        for sp in self.ax_pulse.spines.values():
+            sp.set_visible(False)
 
-        t = np.arange(self._disp_len) / FS - DISP_SEC
-        self._ln_raw, = self.ax_wave.plot(
-            t, list(self._raw_buf),
-            color=C["raw"], lw=0.8, alpha=0.5, label="raw")
-        self._ln_flt, = self.ax_wave.plot(
-            t, list(self._flt_buf),
-            color=C["filtered"], lw=1.4, label="filtered")
-        self._sc_peaks = self.ax_wave.scatter(
-            [], [], color=C["peaks"], s=50, zorder=5, label="beat")
-        self.ax_wave.set_xlim(-DISP_SEC, 0)
-        self.ax_wave.set_xlabel("time (s)", color=C["subtext"], fontsize=9)
-        self.ax_wave.legend(loc="upper left", fontsize=8,
-                            facecolor=C["panel"], edgecolor="none",
-                            labelcolor=C["text"])
-
-        # idle overlay
-        self._idle_text = self.ax_wave.text(
-            0.5, 0.5,
-            "Press   \u25b6  START   to begin measurement",
-            ha="center", va="center",
-            transform=self.ax_wave.transAxes,
-            fontsize=14, color=C["subtext"], style="italic",
-            bbox=dict(boxstyle="round,pad=0.5",
-                      facecolor=C["panel"], edgecolor="none", alpha=0.88),
-        )
+        # a few stacked, widening, fading copies of the same line fake a
+        # neon/CRT glow without a real blur filter (keeps this
+        # dependency-free) — a wide soft halo plus a hot near-white core is
+        # what actually reads as "electric" rather than just a colored line
+        self._ln_pulse_layers = [
+            self.ax_pulse.plot(
+                [], [], color=color, lw=lw, alpha=alpha, zorder=zorder,
+                solid_joinstyle="round", solid_capstyle="round")[0]
+            for lw, alpha, color, zorder in [
+                (9.0, 0.05, C["pulse_trace"], 3),
+                (6.0, 0.10, C["pulse_trace"], 3),
+                (3.5, 0.22, C["pulse_trace"], 3),
+                (1.6, 0.85, C["pulse_trace"], 4),
+                (0.7, 1.00, C["pulse_trace_core"], 5),
+            ]
+        ]
+        # glowing "cursor" dot at the leading edge of the trace, like a
+        # monitor's live sweep position — same stacked-circles glow trick
+        self._dot_layers = [
+            self.ax_pulse.scatter(
+                [], [], s=s, color=color, alpha=alpha, zorder=zorder,
+                edgecolors="none")
+            for s, alpha, color, zorder in [
+                (900, 0.05, C["pulse_trace"], 3),
+                (450, 0.12, C["pulse_trace"], 3),
+                (160, 0.30, C["pulse_trace_core"], 4),
+                (45,  1.00, C["pulse_trace_core"], 5),
+            ]
+        ]
+        # shown whenever the signal isn't locked yet — the window/firmware
+        # warm-up together take several seconds, so this makes clear it's
+        # progressing rather than stuck (mirrors real monitors' "acquiring"/
+        # "no signal" banners)
+        self._txt_pulse_status = self.ax_pulse.text(
+            0.5, 0.5, "",
+            ha="center", va="center", transform=self.ax_pulse.transAxes,
+            fontsize=11, color=C["subtext"], alpha=0.9, zorder=5)
 
         # BPM trend ───────────────────────────────────────────────────────────
         self.ax_bpm = self.fig.add_subplot(gs[1, 0])
         self._style_ax(self.ax_bpm, "BPM Trend", ylabel="BPM")
-        self.ax_bpm.set_ylim(40, 180)
-        self.ax_bpm.grid(color="#2a2f45", linewidth=0.5)
+        self._round_card(self.ax_bpm)
+        self.ax_bpm.set_ylim(BPM_MIN, BPM_MAX)
+        self.ax_bpm.grid(color="#262c40", linewidth=0.6, alpha=0.6)
         self._ln_bpm, = self.ax_bpm.plot(
-            [], [], color=C["bpm_line"], lw=1.8,
-            marker="o", markersize=4, markerfacecolor=C["bpm_line"])
-        self.ax_bpm.set_xlabel("window", color=C["subtext"], fontsize=9)
+            [], [], color=C["bpm_line"], lw=1.6, zorder=3,
+            marker="o", markersize=3.2, markerfacecolor=C["bpm_line"],
+            markeredgecolor=C["bpm_line"], markeredgewidth=0)
+        self.ax_bpm.set_xlabel("time (s)", color=C["subtext"], fontsize=9)
+
+        self._idle_text = self.ax_bpm.text(
+            0.5, 0.5,
+            "Press   ▶  START   to begin measurement",
+            ha="center", va="center",
+            transform=self.ax_bpm.transAxes,
+            fontsize=11, color=C["subtext"], style="italic",
+            bbox=dict(boxstyle="round,pad=0.5",
+                      facecolor=C["panel"], edgecolor="none", alpha=0.88),
+            zorder=4,
+        )
 
         # numeric readout ─────────────────────────────────────────────────────
         self.ax_num = self.fig.add_subplot(gs[1, 1])
-        self.ax_num.set_facecolor(C["panel"])
+        self.ax_num.set_facecolor("none")
         self.ax_num.set_axis_off()
+        self.ax_num.set_xlim(0, 1)
+        self.ax_num.set_ylim(0, 1)
 
-        self._txt_bpm = self.ax_num.text(
-            0.5, 0.58, "---",
+        self._txt_pulse = self.ax_num.text(
+            0.5, 0.84, "♥",
             ha="center", va="center", transform=self.ax_num.transAxes,
-            fontsize=64, fontweight="bold", color=C["text"],
+            fontsize=PULSE_MIN_SIZE, color=C["pulse"])
+        self._txt_bpm = self.ax_num.text(
+            0.5, 0.52, "---",
+            ha="center", va="center", transform=self.ax_num.transAxes,
+            fontsize=44, fontweight="bold", color=C["bpm_value"],
             fontfamily="monospace")
         self.ax_num.text(
-            0.5, 0.24, "BPM",
+            0.5, 0.30, "BPM",
             ha="center", va="center", transform=self.ax_num.transAxes,
-            fontsize=16, color=C["subtext"])
-        self._txt_conf = self.ax_num.text(
-            0.5, 0.10, "press START to measure",
+            fontsize=13, color=C["subtext"])
+
+        # confidence bar — fraction of the last CONFIDENCE_WINDOW readings
+        # that stayed within CONFIDENCE_MAX_DEVIATION BPM of the trailing
+        # trend, i.e. how stable the BPM trend has been recently
+        self._txt_confidence = self.ax_num.text(
+            0.5, 0.155, "confidence --",
             ha="center", va="center", transform=self.ax_num.transAxes,
             fontsize=9, color=C["subtext"])
-        self._rect_conf = plt.Rectangle(
-            (0.1, 0.02), 0.0, 0.04,
+        self._bar_x0, self._bar_w = 0.18, 0.64
+        bar_y, bar_h = 0.06, 0.035
+        self.ax_num.add_patch(mpatches.Rectangle(
+            (self._bar_x0, bar_y), self._bar_w, bar_h,
             transform=self.ax_num.transAxes,
-            color=C["conf_ok"], zorder=2)
-        self.ax_num.add_patch(self._rect_conf)
+            facecolor=C["bar_track"], edgecolor="none", zorder=1))
+        self._bar_fill = mpatches.Rectangle(
+            (self._bar_x0, bar_y), 0.0, bar_h,
+            transform=self.ax_num.transAxes,
+            facecolor=C["bpm_value"], edgecolor="none", zorder=2)
+        self.ax_num.add_patch(self._bar_fill)
 
         # buttons ─────────────────────────────────────────────────────────────
-        btn_w, btn_h = 0.15, 0.07
+        btn_w, btn_h = 0.15, 0.08
         gap          = 0.06
         cx           = 0.5
-        y0           = 0.055
+        y0           = 0.06
 
         ax_s = self.fig.add_axes([cx - btn_w - gap / 2, y0, btn_w, btn_h])
         ax_e = self.fig.add_axes([cx + gap / 2,         y0, btn_w, btn_h])
 
-        self._btn_start = Button(ax_s, "\u25b6  START",
+        self._btn_start = Button(ax_s, "▶  START",
                                  color=C["btn_start_on"],
                                  hovercolor=C["btn_start_hover"])
-        self._btn_stop  = Button(ax_e, "\u25a0  STOP",
+        self._btn_stop  = Button(ax_e, "■  STOP",
                                  color=C["btn_off"],
                                  hovercolor=C["btn_stop_on"])
 
@@ -346,7 +363,7 @@ class PPGMonitor:
 
     @staticmethod
     def _style_ax(ax, title, ylabel=""):
-        ax.set_facecolor(C["panel"])
+        ax.set_facecolor("none")
         ax.set_title(title, color=C["text"], fontsize=11, pad=6)
         if ylabel:
             ax.set_ylabel(ylabel, color=C["subtext"], fontsize=9)
@@ -354,13 +371,25 @@ class PPGMonitor:
         for sp in ax.spines.values():
             sp.set_color(C["panel"])
 
+    @staticmethod
+    def _round_card(ax, facecolor=None):
+        """Draw a rounded 'card' background behind an axes, matplotlib's
+        square facecolor otherwise looks flat/dated next to rounded buttons."""
+        card = mpatches.FancyBboxPatch(
+            (0.0, 0.0), 1.0, 1.0,
+            boxstyle="round,pad=0.02,rounding_size=0.06",
+            transform=ax.transAxes,
+            facecolor=facecolor or C["panel"], edgecolor=C["panel_edge"],
+            linewidth=1.0, zorder=0, clip_on=False,
+        )
+        ax.add_patch(card)
+
     # ── button callbacks ──────────────────────────────────────────────────────
     def _on_start(self, _event):
         if self._measuring:
             return
         self._measuring = True
 
-        # START button goes dim; STOP button lights up
         self._btn_start.color      = C["btn_off"]
         self._btn_start.hovercolor = C["btn_off"]
         self._btn_start.label.set_color(C["subtext"])
@@ -370,6 +399,7 @@ class PPGMonitor:
 
         self._idle_text.set_visible(False)
         self._reset_state()
+        self._start_time = time.perf_counter()
         self.source.start()
         self.fig.canvas.draw_idle()
         print("[ppg] Measurement started")
@@ -384,7 +414,6 @@ class PPGMonitor:
         self._clear_plots()
         self._idle_text.set_visible(True)
 
-        # STOP button goes dim; START button lights up
         self._btn_start.color      = C["btn_start_on"]
         self._btn_start.hovercolor = C["btn_start_hover"]
         self._btn_start.label.set_color(C["btn_txt"])
@@ -396,111 +425,128 @@ class PPGMonitor:
         print("[ppg] Measurement stopped and reset")
 
     def _clear_plots(self):
-        zeros = [0.0] * self._disp_len
-        self._ln_raw.set_ydata(zeros)
-        self._ln_flt.set_ydata(zeros)
-        self._sc_peaks.set_offsets(np.empty((0, 2)))
-        self.ax_wave.set_ylim(-1, 1)
-
         self._ln_bpm.set_data([], [])
-        self.ax_bpm.set_ylim(40, 180)
-        self.ax_bpm.set_xlim(-0.5, BPM_HISTORY - 1)
+        self.ax_bpm.set_ylim(BPM_MIN, BPM_MAX)
+        self.ax_bpm.set_xlim(0, 10)
+
+        for ln in self._ln_pulse_layers:
+            ln.set_data([], [])
+        for dot in self._dot_layers:
+            dot.set_visible(False)
+        self.ax_pulse.set_xlim(0, PULSE_WINDOW_SEC)
+        self._txt_pulse_status.set_text("")
 
         self._txt_bpm.set_text("---")
-        self._txt_bpm.set_color(C["text"])
-        self._txt_conf.set_text("press START to measure")
-        self._txt_conf.set_color(C["subtext"])
-        self._rect_conf.set_width(0)
+        self._txt_bpm.set_color(C["subtext"])
+        self._txt_pulse.set_fontsize(PULSE_MIN_SIZE)
+        self._txt_pulse.set_alpha(0.25)
+        self._txt_pulse.set_color(C["subtext"])
+        self._bar_fill.set_width(0.0)
+        self._txt_confidence.set_text("confidence --")
+        self._txt_confidence.set_color(C["subtext"])
 
     # ── animation ─────────────────────────────────────────────────────────────
     def _update(self, _frame):
         if not self._measuring:
             return
 
-        new = self.source.drain()
-        if not new:
-            return
-
-        self._all_raw.extend(new)
-        for v in new:
-            self._raw_buf.append(v)
-            self._hop_counter  += 1
-            self._sample_count += 1
-
-        # bandpass the display buffer
-        raw_arr = np.array(self._raw_buf, dtype=float)
-        try:
-            flt_arr = filtfilt(self._b, self._a, raw_arr)
-        except Exception:
-            flt_arr = np.zeros_like(raw_arr)
-        self._flt_buf = collections.deque(flt_arr, maxlen=self._disp_len)
-
-        # BPM every HOP_SEC
-        if self._hop_counter >= self._hop_len:
-            self._hop_counter = 0
-            self._compute_bpm()
-
-        # waveform
-        flt_list = list(self._flt_buf)
-        raw_list = list(self._raw_buf)
-        self._ln_raw.set_ydata(raw_list)
-        self._ln_flt.set_ydata(flt_list)
-
-        combined = raw_list + flt_list
-        if any(v != 0 for v in combined):
-            mn, mx = min(combined), max(combined)
-            pad = max((mx - mn) * 0.15, 1)
-            self.ax_wave.set_ylim(mn - pad, mx + pad)
-
-        flt_np = np.array(flt_list)
-        peaks  = detect_peaks(flt_np, self.fs)
-        t_axis = np.arange(self._disp_len) / self.fs - DISP_SEC
-        if len(peaks):
-            self._sc_peaks.set_offsets(
-                np.column_stack([t_axis[peaks], flt_np[peaks]]))
-        else:
-            self._sc_peaks.set_offsets(np.empty((0, 2)))
+        for raw_bpm in self.source.drain():
+            self._process_bpm(raw_bpm)
 
         # BPM trend
         if self._bpm_values:
-            xs = list(range(len(self._bpm_values)))
+            xs = list(self._bpm_times)
             ys = list(self._bpm_values)
             self._ln_bpm.set_data(xs, ys)
-            self.ax_bpm.set_xlim(-0.5, max(xs[-1], BPM_HISTORY - 1) + 0.5)
-            valid = [b for b in ys if b is not None]
-            if valid:
-                self.ax_bpm.set_ylim(max(40,  min(valid) - 10),
-                                     min(180, max(valid) + 10))
+            # BPM_HISTORY caps the deque, so once readings start aging out
+            # the left edge must track xs[0] — pinning it at 0 would leave a
+            # growing blank gap before the oldest surviving point.
+            self.ax_bpm.set_xlim(xs[0], max(xs[-1], xs[0] + 10))
+            self.ax_bpm.set_ylim(max(BPM_MIN, min(ys) - 10),
+                                 min(BPM_MAX, max(ys) + 10))
+
+        locked = self._current_bpm is not None
+
+        self._txt_pulse_status.set_text("" if locked else "waiting for signal…")
 
         # numeric readout
-        if self._current_bpm is not None:
+        if locked:
             self._txt_bpm.set_text(f"{self._current_bpm:.0f}")
-            conf = self._current_conf
-            cw   = min(conf * 0.8, 0.8)
-            self._rect_conf.set_width(cw)
-            self._rect_conf.set_x(0.1)
-            if conf >= 0.5:
-                col, lbl = C["conf_ok"],  f"confidence  {conf:.2f}  \u2713"
-            elif conf >= CONF_THRESH:
-                col, lbl = C["conf_low"], f"confidence  {conf:.2f}  ~"
-            else:
-                col, lbl = C["conf_bad"], f"confidence  {conf:.2f}  \u2717"
-            self._rect_conf.set_color(col)
-            self._txt_conf.set_text(lbl)
-            self._txt_bpm.set_color(col)
+            self._txt_bpm.set_color(C["bpm_value"])
+        else:
+            self._txt_bpm.set_text("--")
+            self._txt_bpm.set_color(C["subtext"])
 
-    def _compute_bpm(self):
-        buf = np.array(self._all_raw, dtype=float)
-        if len(buf) < self._win_len:
-            return
-        bpm, conf = autocorr_bpm(buf[-self._win_len:], self.fs)
-        if bpm is None or conf < CONF_THRESH:
-            return
-        self._bpm_times.append(self._sample_count / self.fs)
-        self._bpm_values.append(round(bpm, 1))
-        self._bpm_confs.append(conf)
-        self._current_bpm  = bpm
-        self._current_conf = conf
+        # confidence bar — how stable the BPM trend has been recently
+        confidence = self._confidence()
+        if confidence is None:
+            self._bar_fill.set_width(0.0)
+            self._txt_confidence.set_text("confidence --")
+            self._txt_confidence.set_color(C["subtext"])
+        else:
+            self._bar_fill.set_width(self._bar_w * confidence)
+            self._bar_fill.set_facecolor(
+                C["bpm_value"] if confidence >= 0.5 else C["confidence_low"])
+            label = "low" if confidence < 0.5 else f"{confidence:.2f}"
+            self._txt_confidence.set_text(f"confidence {label}")
+            self._txt_confidence.set_color(
+                C["text"] if confidence >= 0.5 else C["confidence_low"])
+
+        # pulse — simulated at the current BPM rate, not detected per-beat
+        # (the firmware only reports a periodic aggregate, not individual
+        # beat timestamps). Only animates while `locked`, so no finger on
+        # the sensor means no pulse shown.
+        now = time.perf_counter()
+        elapsed_full = now - self._start_time
+        if self._last_frame_time is None:
+            self._last_frame_time = now
+        dt = now - self._last_frame_time
+        self._last_frame_time = now
+
+        win_start = max(0.0, elapsed_full - PULSE_WINDOW_SEC)
+        win_end   = max(elapsed_full, PULSE_WINDOW_SEC)
+
+        if locked:
+            # A continuously accumulated phase (rather than recomputing
+            # elapsed % period every frame) keeps the beat smooth even as
+            # the BPM estimate drifts — recomputing from absolute elapsed
+            # time made the phase snap discontinuously on every period
+            # change, which is what made the waveform look jagged.
+            rate = self._current_bpm / 60.0  # cycles/sec
+            self._pulse_phase = (self._pulse_phase + dt * rate) % 1.0
+            intensity = self._pulse_shape(self._pulse_phase)
+
+            # The whole visible strip is regenerated analytically every
+            # frame — rather than accreting one sample per animation tick —
+            # so it renders at a fixed, dense resolution independent of
+            # actual frame timing jitter. Earlier phases are reconstructed
+            # by walking the current phase backwards at the current rate;
+            # BPM changes slowly enough relative to the 4s window that this
+            # is visually indistinguishable from tracking the true history.
+            span = elapsed_full - win_start
+            ts = [win_start + i * span / (PULSE_STRIP_POINTS - 1)
+                  for i in range(PULSE_STRIP_POINTS)]
+            vals = [self._pulse_shape((self._pulse_phase - (elapsed_full - t) * rate) % 1.0)
+                    for t in ts]
+        else:
+            self._pulse_phase = 0.0  # next lock starts clean, on a rising edge
+            intensity = 0.0
+            ts, vals = [win_start, elapsed_full], [0.0, 0.0]
+
+        size = PULSE_MIN_SIZE + (PULSE_MAX_SIZE - PULSE_MIN_SIZE) * intensity
+        self._txt_pulse.set_fontsize(size)
+        self._txt_pulse.set_alpha(0.55 + 0.45 * intensity if locked else 0.25)
+        self._txt_pulse.set_color(C["pulse"] if locked else C["subtext"])
+
+        for ln in self._ln_pulse_layers:
+            ln.set_data(ts, vals)
+        self.ax_pulse.set_xlim(win_start, win_end)
+
+        # cursor dot at the trace's leading edge, only while locked
+        for dot in self._dot_layers:
+            dot.set_visible(locked)
+            if locked:
+                dot.set_offsets([[ts[-1], vals[-1]]])
 
     def run(self):
         plt.show()
@@ -509,36 +555,23 @@ class PPGMonitor:
 # ── CLI ───────────────────────────────────────────────────────────────────────
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Real-time PPG heart rate monitor",
+        description="Real-time PPG heart rate monitor (firmware-computed BPM)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    mode = p.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--port",   metavar="PORT",
-                      help="Serial port, e.g. /dev/ttyUSB0 or COM3")
-    mode.add_argument("--replay", metavar="FILE",
-                      help="ODS file to replay (uses 'ac_ppg' column)")
-    p.add_argument("--baud",  type=int,   default=1000000)
-    p.add_argument("--speed", type=float, default=1.0,
-                   help="Replay speed multiplier (default: 1.0)")
+    p.add_argument("--port", required=True, metavar="PORT",
+                   help="Serial port, e.g. /dev/ttyUSB0 or COM3")
+    p.add_argument("--baud", type=int, default=1000000)
     return p.parse_args()
 
 
 def main():
     args = parse_args()
-
-    if args.port:
-        try:
-            src = SerialSource(args.port, args.baud)
-            print(f"[ppg] Ready on {args.port} @ {args.baud} baud  -- press START")
-        except Exception as e:
-            sys.exit(f"[ppg] Cannot open serial port: {e}")
-    else:
-        try:
-            src = ReplaySource(args.replay, speed=args.speed)
-            print(f"[ppg] Loaded '{args.replay}' at {args.speed}x speed  -- press START")
-        except Exception as e:
-            sys.exit(f"[ppg] Cannot open replay file: {e}")
+    try:
+        src = SerialSource(args.port, args.baud)
+        print(f"[ppg] Ready on {args.port} @ {args.baud} baud  -- press START")
+    except Exception as e:
+        sys.exit(f"[ppg] Cannot open serial port: {e}")
 
     PPGMonitor(src).run()
 
