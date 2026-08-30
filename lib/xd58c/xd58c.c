@@ -325,10 +325,10 @@ int xd58c_process(void) {
                               0.5f);
 
     /* hps_peak can reach ~1e20 -- print in dB to avoid an overflowing cast. */
-    LOG_INF("peak_bin=%u k_true=%d hps_peak_db=%d bpm_raw=%u bpm=%u", peak_bin,
+    LOG_DBG("peak_bin=%u k_true=%d hps_peak_db=%d bpm_raw=%u bpm=%u", peak_bin,
             (int)(k_true * 100.0f), (int)(10.0f * log10f(hps_peak + 1e-6f)),
             bpm_raw, bpm);
-    //_uart_write_bpm(bpm);
+    _uart_write_bpm(bpm);
   }
 }
 
