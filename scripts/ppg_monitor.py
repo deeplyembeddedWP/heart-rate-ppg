@@ -26,8 +26,7 @@ Usage
 Firmware assumptions
 --------------------
   UART format: "BPM:xx\\r\\n" per HPS update (~every 1.28 s once warmed up).
-  Non-BPM lines (e.g. stray "FFT:" CSV if CONFIG_XD58C_FFT_DEBUG is left on)
-  are ignored.
+  Non-BPM lines are ignored.
 """
 
 import argparse

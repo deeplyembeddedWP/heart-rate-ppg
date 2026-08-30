@@ -27,14 +27,4 @@ config XD58C_FFT_BPM
       a 512-point real FFT, and emits "BPM:xx\r\n" every 256 samples
       (~1.28 s) instead of the raw sample stream.
 
-config XD58C_FFT_DEBUG
-    bool "FFT spectrum debug output"
-    depends on XD58C_FFT_BPM
-    help
-      After each FFT run, emits a CSV line of the 10 bin magnitudes
-      (bins 1-10, covering 23-235 BPM) in the format:
-      "FFT:mag1,mag2,...,mag10\r\n"
-      Capture with a serial terminal and import into Excel or
-      LibreOffice Calc to plot the frequency spectrum.
-
 endif # XD58C
