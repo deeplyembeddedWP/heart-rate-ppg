@@ -4,6 +4,8 @@ Firmware for a heart rate monitor built on the **nRF52840 DK**, using Nordic nRF
 
 The application reads photoplethysmography (PPG) data from the **XD58C** pulse sensor via ADC, filters and FFT-analyzes it on-device to estimate heart rate, and streams the resulting BPM over UART.
 
+See [`CHANGELOG.md`](CHANGELOG.md) for what's new in each version.
+
 ## Hardware
 
 | Component | Detail |
