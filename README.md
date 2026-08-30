@@ -36,6 +36,16 @@ dts/bindings/   Custom devicetree bindings
 3. `xd58c_process()` — dequeues one sample and transmits it as a decimal string (`"<value>\r\n"`) over UART0.
 4. `main()` calls `xd58c_init()` once, then loops on `xd58c_process()`.
 
+## Live BPM confidence
+
+`scripts/ppg_monitor.py` shows a **confidence** score next to the live BPM, based on how stable recent readings are relative to their own trend — not a measure of skin contact or signal quality directly. Each new reading is compared to the mean of the last 5; confidence is the fraction of the last 5 that landed within ±5 BPM of that mean. ≥0.5 shows green with the score, below that shows red "confidence low".
+
+**Expect ~15–20 seconds** after placing a finger before confidence reliably locks onto the true rate — the FFT-based estimate needs a few ~2.56 s blocks to fill its median filter and reject initial octave-error blips. A drop back to low confidence (e.g. lifting the finger) is reported within a couple of readings.
+
+| Locking on | Locked, steady | Signal lost |
+|---|---|---|
+| ![Locking on](docs/ppg_confidence_locking.png) | ![Steady, high confidence](docs/ppg_confidence_steady.png) | ![Low confidence](docs/ppg_confidence_low.png) |
+
 ## Filter frequency response
 
 `lib/xd58c/xd58c.c` filters every ADC sample through two cascaded biquad filters before it reaches the application:
